@@ -79,7 +79,7 @@
 
 ### 4. Pub/Sub webhook receiver
 **What:** `POST /webhook/gmail` (CONTRACT.md §4.5; function file `api/webhook/gmail.ts`, reached through a `vercel.json` rewrite) together with watch registration and renewal:
-- **Authentication.** Verifies the Pub/Sub OIDC bearer token (`aud`, service-account `email`, `email_verified`).
+- **Authentication.** Compares the `?token=` query parameter to `GOOGLE_PUBSUB_VERIFICATION_TOKEN` in constant time, and fails closed if the variable is unset.
 - **Decoding.** Base64url-decodes `message.data` into `{ emailAddress, historyId }` and looks up the account by email.
 - **Delta.** If the notification's `historyId` is not newer than the stored `last_history_id`, it acks and makes no Gmail calls. Otherwise it runs unit 3's incremental sync from the **stored** `last_history_id`. The notification's ID is the mailbox's new state, not the start point.
 - **Concurrency.** `last_history_id` only ever advances, under a per-user advisory lock, so webhook and list syncs can't clobber each other.
@@ -148,7 +148,8 @@ Vercel details for these files:
 - Each returns `405` for an unsupported method.
 - Every user-facing function returns `401 UNAUTHENTICATED` without a bearer and with a tampered or expired one. A valid local-Supabase user token is accepted, and no response sets a cookie.
 - Each returns the correct §3.3 envelope for an unauthenticated or invalid one.
-- The webhook is exercised by replaying a recorded Pub/Sub push body with `PUBSUB_VERIFY_DISABLED=true` (CONTRACT.md §4.5).
+- The webhook is exercised by replaying a recorded Pub/Sub push body to `/webhook/gmail?token=$GOOGLE_PUBSUB_VERIFICATION_TOKEN`, and returns `401` with a wrong or missing token.
+- An `OPTIONS` preflight to any `/api/v1` endpoint from `FRONTEND_URL` returns `204` with the CORS headers in CONTRACT.md §3.2.
 - The cron function is called by hand with `Authorization: Bearer $CRON_SECRET` and returns `200` with the §4.6 counts. Without the header it returns `401`.
 - A real Google-signed delivery is out of scope for this unit; it is checked on a Vercel preview deployment.
 

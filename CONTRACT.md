@@ -50,7 +50,7 @@ The project is complete when **every** item below is true and verifiable.
 10. The webhook is tested for these cases:
     - **Valid notification:** applies exactly the history delta since the stored `last_history_id`.
     - **Duplicate or stale notification:** a notification whose `historyId` is ≤ the stored one makes no Gmail calls.
-    - **Bad or missing OIDC token:** rejected with `401`.
+    - **Bad or missing `token` query parameter:** rejected with `401`.
     - **Unknown mailbox:** acknowledged without any Gmail call.
     - **Watch renewal cron (§4.6):**
       - a request without the correct `CRON_SECRET` bearer is rejected with `401` and makes no Gmail call;
@@ -77,7 +77,7 @@ The project is complete when **every** item below is true and verifiable.
   - A missing, malformed, expired or wrongly signed token → `UNAUTHENTICATED`.
   - Known limit: local verification does not see server-side sign-out, so a revoked session's token stays accepted until it expires (Supabase default: 1 h). This is accepted for v1.
   - **No anon key.** All DB access, for every endpoint, uses one server-only Supabase client created with `SUPABASE_SERVICE_ROLE_KEY`. This client bypasses RLS, so tenant isolation is enforced in code (§5.3).
-- The webhook (§4.5) and the cron job (§4.6) take no user token; they authenticate with a Pub/Sub OIDC token and `CRON_SECRET` respectively.
+- The webhook (§4.5) and the cron job (§4.6) take no user token; they authenticate with `GOOGLE_PUBSUB_VERIFICATION_TOKEN` and `CRON_SECRET` respectively.
 - Gmail calls use a `googleapis` `OAuth2` client built from the app's Google client ID/secret (env). Its credentials are seeded from `gmail_accounts`: `refresh_token`, `access_token`, and `expiry_date` (from `access_token_expires_at`, as epoch ms).
 - **Access-token persistence.**
   - **Reuse.** The client reuses the stored access token until it is within 5 minutes of expiry, the library's default `eagerRefreshThresholdMillis`. Then it refreshes.
@@ -87,10 +87,16 @@ The project is complete when **every** item below is true and verifiable.
   - **Paired columns.** `access_token` and `access_token_expires_at` are always written together, or both set to `null`. `google-auth-library` treats a credential with no `expiry_date` as *never expiring*, so an access token stored without an expiry would never be refreshed. A DB `CHECK` enforces the pairing (§5.2).
   - **Revocation.** On `invalid_grant`, both access-token columns are set to `null`.
 - Required Google scopes: `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/gmail.send`. The frontend starts sign-in with `signInWithOAuth({ provider: 'google', options: { scopes, queryParams: { access_type: 'offline', prompt: 'consent' } } })` so that Google returns a refresh token.
+- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` configure every `OAuth2Client`. `GOOGLE_REDIRECT_URI` must be registered on that Google OAuth client. The backend never performs an authorization-code exchange in v1, so the value is client configuration only.
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` must be the **same** OAuth client configured in the Supabase Google provider. Google only honours a refresh token for the client it was issued to.
 
 ### 3.2 Format
 
+- **CORS.** Every `/api/v1` endpoint allows exactly one origin, `FRONTEND_URL`.
+  - Responses carry `Access-Control-Allow-Origin: <FRONTEND_URL>` and `Vary: Origin`.
+  - `OPTIONS` preflights get `204`, with `Access-Control-Allow-Methods: GET, POST`, `Access-Control-Allow-Headers: Authorization, Content-Type` and `Access-Control-Max-Age: 600`.
+  - No credentials are allowed (there are no cookies).
+  - The webhook and cron endpoints send no CORS headers.
 - JSON request and response bodies use camelCase. DB columns use snake_case.
 - Timestamps in JSON are ISO-8601 UTC strings (`2026-10-03T14:05:00.000Z`).
 - Gmail IDs (`id`, `threadId`, `historyId`) are always strings.
@@ -183,6 +189,22 @@ The procedure is shared by the connect endpoint (§4.1) and the webhook (§4.5);
   - Afterwards, set `last_history_id` to the response's `historyId`.
 - **404 fallback.** If `history.list` returns **404** (the start ID is outside the retained history window), fall back to a full sync.
 - Both kinds set `gmail_accounts.last_synced_at = now()`.
+
+### 3.6 Environment variables
+
+| Variable | Used by |
+|---|---|
+| `SUPABASE_URL` | Every DB call; JWT issuer check (§3.1) |
+| `SUPABASE_SERVICE_ROLE_KEY` | The single DB client (§3.1, §5.3) |
+| `JWT_SECRET` | Bearer verification (§3.1) |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | `OAuth2Client` (§3.1) |
+| `GOOGLE_PUBSUB_TOPIC` | `users.watch` (§4.5) |
+| `GOOGLE_PUBSUB_VERIFICATION_TOKEN` | Webhook authentication (§4.5) |
+| `ENCRYPTION_KEY` | Token encryption (§5.4) |
+| `FRONTEND_URL` | CORS (§3.2) |
+| `CRON_SECRET` | Cron authentication (§4.6). The name is fixed by Vercel |
+
+A missing required variable fails the function with `500 INTERNAL` and a log line naming the variable, never its value.
 
 ---
 
@@ -412,14 +434,13 @@ Receives Gmail change notifications from a Cloud Pub/Sub **push** subscription a
 
 **Prerequisites (deployment config, env)**
 
-- A Pub/Sub topic `GMAIL_PUBSUB_TOPIC` (`projects/<p>/topics/<t>`) with publish rights granted to `gmail-api-push@system.gserviceaccount.com`.
-- A push subscription to this URL with OIDC authentication enabled, configured by:
-  - `PUBSUB_PUSH_AUDIENCE`: the expected `aud` of the token.
-  - `PUBSUB_PUSH_SERVICE_ACCOUNT`: the expected `email` of the token.
+- `GOOGLE_PUBSUB_TOPIC`: a Pub/Sub topic (`projects/<p>/topics/<t>`) with publish rights granted to `gmail-api-push@system.gserviceaccount.com`.
+- `GOOGLE_PUBSUB_VERIFICATION_TOKEN`: a random string of at least 32 characters, shared with Pub/Sub through the push URL.
+- A push subscription whose endpoint is `https://<host>/webhook/gmail?token=<GOOGLE_PUBSUB_VERIFICATION_TOKEN>`. The `vercel.json` rewrite preserves the query string.
 
 **Watch registration and renewal**
 
-- `MailProvider.watch()` calls `users.watch({ topicName: GMAIL_PUBSUB_TOPIC, labelIds: ['INBOX'], labelFilterBehavior: 'INCLUDE' })`. It stores the response's `expiration` in `gmail_accounts.watch_expiration`.
+- `MailProvider.watch()` calls `users.watch({ topicName: GOOGLE_PUBSUB_TOPIC, labelIds: ['INBOX'], labelFilterBehavior: 'INCLUDE' })`. It stores the response's `expiration` in `gmail_accounts.watch_expiration`.
 - It is called:
   - at the end of a successful OAuth callback (§4.1), so a new account receives push immediately;
   - once a day for every connected account, by the cron job in §4.6.
@@ -427,7 +448,7 @@ Receives Gmail change notifications from a Cloud Pub/Sub **push** subscription a
 
 **Request** — `Content-Type: application/json`
 
-The request carries the header `Authorization: Bearer <Google-signed OIDC JWT>`. Its body:
+The request URL carries `?token=<GOOGLE_PUBSUB_VERIFICATION_TOKEN>`. Its body:
 
 ```ts
 interface PubSubPushBody {
@@ -442,10 +463,11 @@ interface PubSubPushBody {
 
 **Behavior**
 
-1. Verify the OIDC token with `google-auth-library`. The only exception is the local-replay flag below.
-   - **Local replay flag.** `PUBSUB_VERIFY_DISABLED=true` skips this step. It takes effect only when `VERCEL_ENV === 'development'`, which is the value `vercel dev` and the pulled development env provide and which tests set explicitly. If the flag is set anywhere else, every webhook request fails closed with `500 INTERNAL` and an error log line.
-
-   Verification itself uses `OAuth2Client.verifyIdToken`. `aud` must equal `PUBSUB_PUSH_AUDIENCE`, `email` must equal `PUBSUB_PUSH_SERVICE_ACCOUNT`, and `email_verified` must be true. Otherwise → `UNAUTHENTICATED`.
+1. **Verify the shared token.**
+   - If `GOOGLE_PUBSUB_VERIFICATION_TOKEN` is unset or empty → `500 INTERNAL` (fail closed).
+   - Compare the `token` query parameter to it in constant time (`crypto.timingSafeEqual` on equal-length buffers). If it is missing or doesn't match → `UNAUTHENTICATED`.
+   - There is no bypass. A local replay simply sends the same `?token=` from `.env`.
+   - Known limit: the token sits in the URL, so it can appear in access logs. Rotate it by updating the env var and the subscription endpoint together.
 2. Decode `message.data` into `{ emailAddress, historyId }`. If it fails → `VALIDATION_FAILED`.
 3. Look up `gmail_accounts` by `email = emailAddress`. If there is no row, or no refresh token → **ack** (`204`) and make no Gmail call.
 4. **Delta rule:**
@@ -468,7 +490,7 @@ Pub/Sub redelivers on any non-2xx status, so only retryable failures return non-
 
 | Code | HTTP | Trigger |
 |---|---|---|
-| `UNAUTHENTICATED` | 401 | Missing or invalid OIDC token, or wrong `aud`/`email`. |
+| `UNAUTHENTICATED` | 401 | Missing or wrong `token` query parameter. |
 | `VALIDATION_FAILED` | 400 | Body not JSON, or `message.data` does not decode to `{ emailAddress, historyId }`. |
 | `GMAIL_RATE_LIMITED` | 429 | Gmail rate limit during sync. Pub/Sub retries with backoff. |
 | `SYNC_FAILED` | 502 | Any other Gmail failure during sync. |
@@ -581,9 +603,9 @@ Constraints and indexes:
 |---|---|---|---|
 | `user_id` | `uuid` PK, FK → `auth.users(id)` on delete cascade | no | Session |
 | `email` | `text` | no | `claims.email` of the bearer token (§4.1) |
-| `refresh_token` | `text` (encrypted via Supabase Vault / pgsodium) | yes | `providerRefreshToken` from the §4.1 request body (or Google's rotated one); `null` after revocation (§4.5, §4.6) |
+| `refresh_token` | `text`: ciphertext (§5.4) | yes | `providerRefreshToken` from the §4.1 request body (or Google's rotated one); `null` after revocation (§4.5, §4.6) |
 | `scopes` | `text[]` | no | Granted scopes from token info |
-| `access_token` | `text` (encrypted like `refresh_token`) | yes | §4.1: the `access_token` from its proving refresh. Afterwards: `tokens.access_token` from the `'tokens'` event |
+| `access_token` | `text`: ciphertext (§5.4) | yes | §4.1: the `access_token` from its proving refresh. Afterwards: `tokens.access_token` from the `'tokens'` event |
 | `access_token_expires_at` | `timestamptz` | yes | §4.1: that refresh's `expiry_date`. Afterwards: `tokens.expiry_date` (epoch ms) from the `'tokens'` event |
 | `last_history_id` | `text` | yes | Max `historyId` after the last successful sync; `null` forces a full sync |
 | `last_synced_at` | `timestamptz` | yes | Server time |
@@ -607,6 +629,16 @@ Every query runs as the service role, so RLS does not protect user data. The rul
   - `findAccountByEmailUnscoped(email)`, for the webhook (§4.5);
   - `listConnectedAccountsUnscoped()`, for the cron job (§4.6).
 - `SUPABASE_SERVICE_ROLE_KEY` is server-only and never logged or returned.
+
+### 5.4 Token encryption
+
+OAuth tokens are encrypted in application code before they reach the database. They are never stored in plaintext.
+
+- **Algorithm:** AES-256-GCM via Node `crypto`.
+- **Key:** `ENCRYPTION_KEY`, 32 random bytes encoded as base64. Startup fails if it doesn't decode to exactly 32 bytes.
+- **Stored form:** `v1:<iv b64>:<authTag b64>:<ciphertext b64>`, with a fresh 12-byte IV per write. The `v1` prefix allows key rotation later.
+- **Columns:** `gmail_accounts.refresh_token` and `gmail_accounts.access_token`. Only `src/db/` encrypts and decrypts, and plaintext tokens never leave the server process.
+- **Integrity:** a decryption failure (wrong key, or a tampered value) is treated as revoked: `GMAIL_TOKEN_REVOKED`.
 
 ---
 

@@ -62,11 +62,11 @@ With the Supabase GitHub integration, merging into `main` runs the migration on 
 
 - **Never use `any`** as a TypeScript type.
 - **Never poll the Gmail API for new messages.** Use Pub/Sub push webhooks. Gmail is read only by the initial full sync at connect time and by the webhook (CONTRACT.md §3.5). `GET /api/v1/messages` reads the DB only.
-- **Never store OAuth tokens in plaintext.** `refresh_token` and `access_token` are encrypted at rest (Vault/pgsodium).
+- **Never store OAuth tokens in plaintext.** `refresh_token` and `access_token` are encrypted with AES-256-GCM using `ENCRYPTION_KEY`, in `src/db/` only (CONTRACT.md §5.4).
 - **Never make Gmail API calls without the `googleapis` `OAuth2` client.** It handles token refresh automatically. Its `'tokens'` listener persists `access_token` and `access_token_expires_at` as a pair; a missing `expiry_date` makes the library treat a token as never-expiring.
 - **Never write to `src/db/` from the schema session.**
 - **Never merge the schema session before `npm test` exits 0.**
-- **Never hardcode credentials.** All secrets come from env (template: `.env.example`): `JWT_SECRET`, `SUPABASE_SERVICE_ROLE_KEY`, the Google client, Pub/Sub and `CRON_SECRET`.
+- **Never hardcode credentials.** All secrets come from env. The full list is in CONTRACT.md §3.6, and the template is `.env.example`.
 
 ## Coding conventions
 
@@ -77,7 +77,7 @@ With the Supabase GitHub integration, merging into `main` runs the migration on 
   - Tokens are verified with `jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'], audience: 'authenticated', issuer: SUPABASE_URL + '/auth/v1' })`. The algorithm allow-list is mandatory.
   - `userId` comes only from the token's `sub`.
 - **Machine endpoints** are outside `/api/v1` and don't use the user JWT:
-  - The Pub/Sub webhook is at **`/webhook/gmail`**, implemented in `api/webhook/gmail.ts` and reached through a `vercel.json` rewrite. It authenticates with Pub/Sub's Google-signed OIDC token.
+  - The Pub/Sub webhook is at **`/webhook/gmail`**, implemented in `api/webhook/gmail.ts` and reached through a `vercel.json` rewrite. It authenticates with a `?token=` query parameter equal to `GOOGLE_PUBSUB_VERIFICATION_TOKEN`, compared in constant time.
   - The cron job is at `/api/cron/renew-watches` and authenticates with the `CRON_SECRET` bearer.
 - **Tenant isolation:** the service-role client bypasses RLS, so every user-scoped query lives in `src/db/` and filters on `user_id`.
   - Only `findAccountByEmailUnscoped` (webhook) and `listConnectedAccountsUnscoped` (cron) may skip that filter.
