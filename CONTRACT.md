@@ -37,7 +37,7 @@ The project is complete when **every** item below is true and verifiable.
 1. All six routes exist at the exact paths in §4 and accept/return exactly the shapes defined there.
 2. Every `ErrorCode` listed in an endpoint's error table has at least one Jest test that triggers it and asserts the HTTP status and the error envelope from §3.3.
 3. `jest --ci --runInBand` passes (TypeScript via `ts-jest`, TypeScript pinned to 6.x because `ts-jest` does not support 7), including integration tests running against local Supabase (`supabase start`) with the `schema` branch's migration applied, in the §6 Gate 1 worktree.
-4. `tsc --noEmit` passes with `strict: true`, and lint passes with zero errors.
+4. `npm run typecheck` (`tsc -p tsconfig.check.json`, covering `src/`, `api/` and `tests/`) passes with `strict: true`, and lint passes with zero errors.
 5. A fixture test maps a recorded Gmail `users.messages.get?format=full` response to a `messages` row that matches §5 field for field. It includes a nested `multipart/alternative` inside `multipart/mixed` and one attachment.
 6. Sync is tested for: first sync (no stored `historyId` → full sync, which stores at most 50 messages even when the inbox holds more), incremental sync (`history.list`), and fallback (`history.list` returns HTTP 404 → full sync). `GET /api/v1/messages` makes zero Gmail API calls (asserted with a fake `MailProvider` that fails on any call).
 7. Mark-as-read is idempotent: calling it twice on the same message returns `200` both times with `isRead: true`.
@@ -667,7 +667,7 @@ OAuth tokens are encrypted in application code before they reach the database. T
    git merge --no-ff --no-edit schema
    supabase db reset
    npm test
-   npx tsc --noEmit
+   npm run typecheck
    npm run lint
    ```
 

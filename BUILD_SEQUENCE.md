@@ -25,7 +25,7 @@
 | `markRead(id)` | `users.messages.modify` (`removeLabelIds: ['UNREAD']`) | Mark as read (§4.4) |
 | `watch()` | `users.watch` (`topicName`, `labelIds: ['INBOX']`) → `historyId`, `expiration` | Push registration and renewal (§4.5) |
 
-**Verified:** TypeScript compiles clean (`tsc --noEmit`), and the interface defines all required methods (the six above).
+**Verified:** TypeScript compiles clean (`npm run typecheck`), and the interface defines all required methods (the six above).
 
 ### 2. Gmail OAuth layer with token persistence listener
 **What:** Everything that gets Google tokens and keeps them current:
@@ -181,5 +181,5 @@ Vercel details for these files:
 
 - **Schema session first (draft).** On the `schema` branch: `supabase/migrations/` and `src/types/`, pushed but not merged or reviewed. Units 2–8 need both.
 - **Units 1–8 belong to the server session** on `main`. Every unit's check runs in the Gate 1 worktree (`main` merged with `schema`), because `main` alone lacks `src/types/`.
-- **Gate 1:** unit 8 passing, so `npm test` exits 0, plus `tsc --noEmit` and lint clean.
+- **Gate 1:** unit 8 passing, so `npm test` exits 0, plus `npm run typecheck` and lint clean.
 - **Schema session (review + merge)** happens only after Gate 1, and it adds no build units.

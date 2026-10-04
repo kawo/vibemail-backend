@@ -20,6 +20,9 @@ Any change to an endpoint, an `ErrorCode` or a stored field goes into `CONTRACT.
 - **Auth tokens:** `jsonwebtoken` verifies Supabase access tokens.
 - **Tests:** Jest via `ts-jest`, plus `supertest`. `supertest` needs a small adapter, because the handlers take a Web `Request` rather than a Node `http.Server`.
 - **Deployment:** Vercel Functions under top-level `api/`, with no framework. Each file exports `GET`/`POST(request: Request): Promise<Response>` on the Node.js runtime (never Edge). `vercel.json` holds the cron job, the per-function `maxDuration`, and the `/webhook/gmail` rewrite.
+- **Two tsconfigs.** `tsconfig.json` keeps `rootDir: ./src` while also including `api/`, so plain `tsc` fails with TS6059. Never run bare `tsc`; Vercel compiles `api/` itself.
+  - **Type-checking:** always via `tsconfig.check.json`, which extends the base config with `rootDir: "."`, `noEmit` and `tests/`.
+  - **Jest:** when the Jest config is created, point ts-jest at that file: `transform: { '^.+\.ts$': ['ts-jest', { tsconfig: 'tsconfig.check.json' }] }`.
 - **Blocked install scripts:** npm blocked them for `esbuild`, `unrs-resolver` and `@parcel/watcher`. If `vercel dev` or Jest resolution fails, check `npm install-scripts ls`.
 
 ## Commands
@@ -28,7 +31,7 @@ Any change to an endpoint, an `ErrorCode` or a stored field goes into `CONTRACT.
 npm test                            # must run `jest --ci --runInBand`; package.json still has the npm placeholder
 npx jest tests/unit/foo.test.ts     # single file
 npx jest -t "name of test"          # single test by name
-npx tsc --noEmit                    # typecheck
+npm run typecheck                   # tsc -p tsconfig.check.json (src/, api/, tests/)
 supabase start                      # local Postgres/Auth for integration tests
 supabase db reset                   # re-apply supabase/migrations
 vercel dev                          # local preview of api/
@@ -49,7 +52,7 @@ Server code imports from `src/types/`, which exists only on `schema` until the m
 
 ## Sequencing rule
 
-**The schema session cannot be merged until the server-logic tests pass.** `npm test` must exit 0, and `tsc` and lint must be clean, in the Gate 1 worktree, on the current tips of both branches.
+**The schema session cannot be merged until the server-logic tests pass.** `npm test` must exit 0, and `npm run typecheck` and lint must be clean, in the Gate 1 worktree, on the current tips of both branches.
 
 The order is:
 1. The schema session drafts the schema and pushes it unmerged.
