@@ -87,6 +87,6 @@ With the Supabase GitHub integration, merging into `main` runs the migration on 
 - **Tenant isolation:** the service-role client bypasses RLS, so every user-scoped query lives in `src/db/` and filters on `user_id`.
   - Only `findAccountByEmailUnscoped` (webhook) and `listConnectedAccountsUnscoped` (cron) may skip that filter.
   - RLS is enabled with no policies, which closes the public Data API.
-- **Sync state:** sync starts from the **stored** `last_history_id`, never from a notification's `historyId`. That value only advances, under a per-user advisory lock. A `history.list` 404 falls back to a full sync of the 50 newest messages.
+- **Sync state:** sync starts from the **stored** `last_history_id`, never from a notification's `historyId`. That value only advances, under a per-user advisory lock; both live in the `apply_sync_batch` / `advance_last_history_id` DB functions (CONTRACT.md §5.5). A `history.list` 404 falls back to a full sync of the 50 newest messages.
 - **Webhook responses:** the webhook returns non-2xx only when a retry could help, because Pub/Sub redelivers on any non-2xx.
 - **Replies:** the server derives the reply subject (`Re: <original>`), because Gmail threads only when the subject, `threadId`, `In-Reply-To` and `References` all match.
