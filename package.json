@@ -8,7 +8,11 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "db:push": "supabase db push",
+    "db:types": "supabase gen types typescript --linked > src/types/database.ts",
+    "build": "npm run typecheck",
+    "test": "jest --ci --runInBand",
+    "dev": "vercel dev",
     "typecheck": "tsc -p tsconfig.check.json"
   },
   "repository": {
