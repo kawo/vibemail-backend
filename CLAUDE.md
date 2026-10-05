@@ -28,13 +28,15 @@ Any change to an endpoint, an `ErrorCode` or a stored field goes into `CONTRACT.
 ## Commands
 
 ```bash
-npm test                            # must run `jest --ci --runInBand`; package.json still has the npm placeholder
+npm test                            # jest --ci --runInBand (needs a jest.config pointing ts-jest at tsconfig.check.json)
 npx jest tests/unit/foo.test.ts     # single file
 npx jest -t "name of test"          # single test by name
-npm run typecheck                   # tsc -p tsconfig.check.json (src/, api/, tests/)
+npm run typecheck                   # tsc -p tsconfig.check.json (src/, api/, tests/); `npm run build` runs the same
+npm run dev                         # vercel dev: local preview of api/
 supabase start                      # local Postgres/Auth for integration tests
 supabase db reset                   # re-apply supabase/migrations
-vercel dev                          # local preview of api/
+npm run db:types                    # schema session only: regenerate src/types/database.ts from the linked project
+npm run db:push                     # pushes migrations to the hosted project; only after Gate 1 (CONTRACT.md §6)
 ```
 
 `--runInBand` is required because the integration tests share one local database. A run counts as passing only when `numFailedTests`, `numPendingTests` and `numTodoTests` are all 0 in `--json` output. A leftover `.only` surfaces as pending tests.
