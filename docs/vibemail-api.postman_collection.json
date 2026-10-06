@@ -1999,8 +1999,8 @@
       ]
     },
     {
-      "name": "4.6 Watch-renewal cron — GET /api/cron/renew-watches",
-      "description": "Daily Vercel Cron Job that renews Gmail watches (CONTRACT.md §4.6). Authenticated by `Authorization: Bearer {{cronSecret}}`. Not built yet (BUILD_SEQUENCE.md unit 4): until it is, these requests return 404.",
+      "name": "4.6 Watch-renewal cron — GET /api/cron/renew-watch",
+      "description": "Daily Vercel Cron Job that renews Gmail watches (CONTRACT.md §4.6). Authenticated by `Authorization: Bearer {{cronSecret}}`. Built in BUILD_SEQUENCE.md unit 4.",
       "item": [
         {
           "name": "Happy path — 200 counts",
@@ -2014,14 +2014,14 @@
               }
             ],
             "url": {
-              "raw": "{{baseUrl}}/api/cron/renew-watches",
+              "raw": "{{baseUrl}}/api/cron/renew-watch",
               "host": [
                 "{{baseUrl}}"
               ],
               "path": [
                 "api",
                 "cron",
-                "renew-watches"
+                "renew-watch"
               ]
             }
           },
@@ -2044,14 +2044,14 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{baseUrl}}/api/cron/renew-watches",
+              "raw": "{{baseUrl}}/api/cron/renew-watch",
               "host": [
                 "{{baseUrl}}"
               ],
               "path": [
                 "api",
                 "cron",
-                "renew-watches"
+                "renew-watch"
               ]
             }
           },
@@ -2085,14 +2085,14 @@
               }
             ],
             "url": {
-              "raw": "{{baseUrl}}/api/cron/renew-watches",
+              "raw": "{{baseUrl}}/api/cron/renew-watch",
               "host": [
                 "{{baseUrl}}"
               ],
               "path": [
                 "api",
                 "cron",
-                "renew-watches"
+                "renew-watch"
               ]
             },
             "description": "Cannot be triggered by the request alone. To reproduce: run the server without CRON_SECRET. The job fails closed."
