@@ -119,8 +119,11 @@
 - **Delta.** If the notification's `historyId` is not newer than the stored `history_id`, it acks and makes no Gmail calls. Otherwise it runs unit 3's incremental sync from the **stored** `history_id`. The notification's ID is the mailbox's new state, not the start point.
 - **Concurrency.** `history_id` only ever advances, under a per-user advisory lock, so webhook and list syncs can't clobber each other.
 - **Acks.** `src/webhook/gmail.ts` checks the token and decodes the body, then returns `200` at once and runs the sync inside `waitUntil` (`@vercel/functions`). Background failures are logged, not retried; the next notification catches up from the stored `history_id`.
-- **Watch.** `watch()` is called after the OAuth callback. Daily renewal is a separate cron job (`GET /api/cron/renew-watches`, CONTRACT.md §4.6), with its logic in `src/cron`; user requests never call `watch()`.
-- **Cron renewal.** The cron logic checks the `CRON_SECRET` bearer and fails closed if the secret is unset. It renews every connected account with a concurrency limit of 5, isolates failures per account, and clears tokens on `invalid_grant`.
+- **Watch.** `watch()` is called after the OAuth callback. Daily renewal is a separate cron job (`GET /api/cron/renew-watch`, CONTRACT.md §4.6), with its logic in `src/cron`; user requests never call `watch()`.
+- **Cron renewal.** `src/cron/renewWatch.ts`, wired as `api/cron/renew-watch.ts` (daily `0 6 * * *`). The cron logic:
+  - checks the `CRON_SECRET` bearer, and fails closed if the secret is unset;
+  - renews every connected account whose watch is missing, expired or within 24 h of expiry, 5 at a time;
+  - isolates failures per account, and clears tokens on `invalid_grant`.
 
 **Verified:** A notification fetches the correct delta through history ID. Concretely:
 - Given a stored `history_id = H` and a notification carrying `historyId = H2 > H`, the receiver calls `history.list` with `startHistoryId = H`, never `H2`.
@@ -166,7 +169,7 @@
 | `api/v1/messages/send.ts` | `POST /api/v1/messages/send` §4.3 | Unit 5 (`src/send`) |
 | `api/v1/messages/[id]/read.ts` | `POST /api/v1/messages/{id}/read` §4.4 | Unit 6 |
 | `api/webhook/gmail.ts` | `POST /webhook/gmail` §4.5 (rewrite → `/api/webhook/gmail`) | Unit 4 (`src/webhook`) |
-| `api/cron/renew-watches.ts` | `GET /api/cron/renew-watches` §4.6 | Unit 4 (`src/cron`) |
+| `api/cron/renew-watch.ts` | `GET /api/cron/renew-watch` §4.6 | Unit 4 (`src/cron`) |
 
 Vercel details for these files:
 - **Handler shape.** Each file exports named Web-standard handlers, `export async function GET(request: Request): Promise<Response>` or `POST`, and nothing else. An HTTP method with no exported handler gets `405`.
@@ -179,7 +182,7 @@ Vercel details for these files:
   Every `/api/v1` function calls it first, except the OAuth callback, which verifies the signed `state` instead.
 - **Path param.** `[id]/read.ts` reads `id` from `new URL(request.url).pathname`, decodes it, and rejects an empty value with `VALIDATION_FAILED`.
 - **Routing.** `vercel.json` holds the rewrite `/webhook/gmail` → `/api/webhook/gmail`.
-- **Duration.** `vercel.json` sets `functions["api/v1/auth/google/callback.ts"].maxDuration` and `functions["api/webhook/gmail.ts"].maxDuration`, because both run a sync. It also sets `functions["api/cron/renew-watches.ts"].maxDuration = 300`, and the `crons` entry from CONTRACT.md §4.6. A function that exceeds it gets a platform `504`.
+- **Duration.** `vercel.json` sets `functions["api/v1/auth/google/callback.ts"].maxDuration` and `functions["api/webhook/gmail.ts"].maxDuration`, because both run a sync. It also sets `functions["api/cron/renew-watch.ts"].maxDuration = 300`, and the `crons` entry from CONTRACT.md §4.6. A function that exceeds it gets a platform `504`.
 - **Env.** Local env comes from `vercel env pull`.
 
 **Verified:** All seven endpoints respond correctly in local preview (`vercel dev` with the local Supabase stack):

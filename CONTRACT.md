@@ -54,7 +54,7 @@ The project is complete when **every** item below is true and verifiable.
     - **Unknown mailbox:** acknowledged without any Gmail call.
     - **Watch renewal cron (§4.6):**
       - a request without the correct `CRON_SECRET` bearer is rejected with `401` and makes no Gmail call;
-      - an authorized run calls `users.watch` once for every connected account and updates `watch_expiration`;
+      - an authorized run calls `users.watch` once for every connected account whose watch is missing, expired or within 24 h of expiry, skips the rest, and updates `watch_expiration`;
       - one account failing (including `invalid_grant`) does not stop the others.
 11. Tenant isolation is tested:
     - through every user-facing endpoint, user A cannot read or modify user B's `messages` or `users` rows;
@@ -507,24 +507,24 @@ Only failures detected **before** the ack return non-2xx. Pub/Sub retries those,
 
 ---
 
-### 4.6 Watch-renewal cron job — `GET /api/cron/renew-watches`
+### 4.6 Watch-renewal cron job — `GET /api/cron/renew-watch`
 
-A Vercel Cron Job that renews the Gmail push watch (§4.5) for every connected account once a day. Only Vercel's scheduler calls this endpoint; it is not user-facing.
+A Vercel Cron Job, run once a day, that renews the Gmail push watch (§4.5) for every connected account whose watch is missing, expired, or expires within 24 hours. Only Vercel's scheduler calls this endpoint; it is not user-facing.
 
 **Configuration**
 
-- Function file: `api/cron/renew-watches.ts`, with its logic in `src/cron`.
+- Function file: `api/cron/renew-watch.ts`, with its logic in `src/cron/renewWatch.ts`.
 - `vercel.json`:
 
   ```json
   {
-    "crons": [{ "path": "/api/cron/renew-watches", "schedule": "0 6 * * *" }],
-    "functions": { "api/cron/renew-watches.ts": { "maxDuration": 300 } }
+    "crons": [{ "path": "/api/cron/renew-watch", "schedule": "0 6 * * *" }],
+    "functions": { "api/cron/renew-watch.ts": { "maxDuration": 300 } }
   }
   ```
 
 - Env: `CRON_SECRET`, a random string of at least 32 characters. Vercel sends it as `Authorization: Bearer <CRON_SECRET>` on every cron invocation.
-- Vercel runs cron jobs against production deployments only. On a preview or locally, trigger the job by hand with `vercel crons run /api/cron/renew-watches`, or by sending the bearer header yourself.
+- Vercel runs cron jobs against production deployments only. On a preview or locally, trigger the job by hand with `vercel crons run /api/cron/renew-watch`, or by sending the bearer header yourself.
 
 **Request**
 
@@ -533,10 +533,11 @@ The request has no body and no query parameters. The only header that matters is
 **Behavior**
 
 1. **Authenticate.** If `CRON_SECRET` is unset or empty → `500 INTERNAL` (fail closed: the job never runs unauthenticated). If the header is missing or doesn't match (constant-time comparison) → `UNAUTHENTICATED`.
-2. **Select accounts.** Using the service-role key (§5.2), select every `users` row with a non-null `refresh_token`.
-3. **Renew.** For each account, call `MailProvider.watch()` and store the new `watch_expiration`. Calls run with a concurrency limit of 5. Failures are per account, never fatal for the run:
+2. **Select accounts.** Using `listConnectedAccountsUnscoped({ watchExpiringBefore: now + 24 h })` (§5.3), select every `users` row with a non-null `refresh_token` where `watch_expiration` is null or earlier than `now + 24 h`. That covers watches that are expiring soon, already expired after a missed run, or never registered because `watch()` failed at connect.
+3. **Renew.** For each account, call `MailProvider.watch()` (`users.watch` on `GOOGLE_PUBSUB_TOPIC`) and store the new `watch_expiration`. Gmail returns no resource ID, so none is stored. Calls run with a concurrency limit of 5. Failures are per account, never fatal for the run:
    - `invalid_grant`: clear `refresh_token`, `access_token` and `access_token_expires_at`, as in §4.5, and count the account as `revoked`.
-   - Rate limit or other Gmail error: log it, count the account as `failed`, and leave the existing `watch_expiration` unchanged. The next daily run retries; Gmail's 7-day window allows six missed runs.
+   - Stored tokens that cannot be decrypted (§5.4): treated like `invalid_grant`.
+   - Rate limit or other Gmail error: log it, count the account as `failed`, and leave the existing `watch_expiration` unchanged. The next daily run retries it. Because only watches with less than 24 h left are renewed, a single missed run can let a watch lapse. Push then stops until the next run renews it, and sync catches up from the stored `history_id` (§3.5).
 4. **Respond** with the counts.
 
 **Response — `200 OK`** (also returned when some accounts failed)
@@ -640,7 +641,7 @@ Every query runs as the service role, so RLS does not protect user data. The rul
 - `userId` comes only from the verified token's `sub` (§3.1). It is never read from the request body, query string or path.
 - Exactly two functions may query without a `user_id` filter, and their names say so:
   - `findAccountByEmailUnscoped(email)`, for the webhook (§4.5);
-  - `listConnectedAccountsUnscoped()`, for the cron job (§4.6).
+  - `listConnectedAccountsUnscoped({ watchExpiringBefore })`, for the cron job (§4.6).
 - `SUPABASE_SERVICE_ROLE_KEY` is server-only and never logged or returned.
 
 ### 5.4 Token encryption

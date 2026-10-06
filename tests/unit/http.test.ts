@@ -55,6 +55,7 @@ function setup(connected = true) {
     supabaseUrl: SUPABASE,
     frontendUrl: FRONTEND,
     pubsubVerificationToken: 't'.repeat(32),
+    cronSecret: 'c'.repeat(32),
     waitUntil: (p) => {
       pending.push(p);
     },
@@ -249,6 +250,17 @@ describe('webhook, preflight and configuration', () => {
     const response = await h.gmailWebhook(post('/api/webhook/gmail?token=wrong', { message: { data: 'x' } }));
     expect(response.status).toBe(401);
     expect(response.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('runs the cron job with the CRON_SECRET bearer, without CORS', async () => {
+    const { h } = setup();
+    const ok = await h.renewWatch(new Request('https://api.vibemail.test/api/cron/renew-watch', { headers: { Authorization: `Bearer ${'c'.repeat(32)}` } }));
+    expect(ok.status).toBe(200);
+    await expect(ok.json()).resolves.toMatchObject({ renewed: 1, revoked: 0, failed: 0 });
+    expect(ok.headers.get('access-control-allow-origin')).toBeNull();
+    const denied = await h.renewWatch(new Request('https://api.vibemail.test/api/cron/renew-watch'));
+    expect(denied.status).toBe(401);
+    await expect(envelope(denied)).resolves.toMatchObject({ error: { code: 'UNAUTHENTICATED' } });
   });
 
   it('answers CORS preflight with 204', async () => {

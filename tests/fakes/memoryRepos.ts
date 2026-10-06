@@ -1,5 +1,11 @@
 import type { ListCursor, MessageRow, MessagesRepository } from '../../src/db/messages';
-import type { ConnectedAccount, ConnectedUserInput, UpsertResult, UsersRepository } from '../../src/db/users';
+import type {
+  ConnectedAccount,
+  ConnectedUserInput,
+  RenewalCandidate,
+  UpsertResult,
+  UsersRepository,
+} from '../../src/db/users';
 import type { AccountCredentials, TokenUpdate } from '../../src/providers/provider';
 
 export interface MemoryUserRow extends ConnectedUserInput {
@@ -59,6 +65,14 @@ export class MemoryUsers implements UsersRepository {
       return null;
     }
     return { userId: row.userId, historyId: row.historyId, credentials: row.credentials };
+  }
+  /** Users whose stored tokens should read as undecryptable. */
+  undecryptable = new Set<string>();
+  async listConnectedAccountsUnscoped({ watchExpiringBefore }: { watchExpiringBefore: Date }): Promise<RenewalCandidate[]> {
+    return [...this.rows.values()]
+      .filter((r) => !this.cleared.includes(r.userId))
+      .filter((r) => r.watch === undefined || r.watch.getTime() < watchExpiringBefore.getTime())
+      .map((r) => ({ userId: r.userId, credentials: this.undecryptable.has(r.userId) ? null : r.credentials }));
   }
   async clearUserTokens(userId: string): Promise<void> {
     this.cleared.push(userId);

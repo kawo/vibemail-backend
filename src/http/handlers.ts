@@ -1,3 +1,4 @@
+import { renewWatches, verifyCronSecret } from '../cron/renewWatch';
 import { ApiError } from '../middleware/errors';
 import { requireUser } from '../middleware/auth';
 import { issueState, verifyState } from '../middleware/oauthState';
@@ -27,6 +28,7 @@ export interface Handlers {
   sendMessage: Handler;
   markRead: Handler;
   gmailWebhook: Handler;
+  renewWatch: Handler;
 }
 
 export function createHandlers(getDeps: () => AppDeps): Handlers {
@@ -174,6 +176,22 @@ export function createHandlers(getDeps: () => AppDeps): Handlers {
         waitUntil: deps.waitUntil,
         log: deps.log,
       });
+    },
+
+    /** Vercel Cron, CONTRACT.md §4.6. No CORS: only Vercel's scheduler calls it. */
+    async renewWatch(request) {
+      try {
+        const deps = getDeps();
+        verifyCronSecret(request.headers.get('authorization'), deps.cronSecret);
+        const result = await renewWatches({ factory: deps.factory, users: deps.users, now: deps.now, log: deps.log });
+        return jsonResponse(result, 200);
+      } catch (error) {
+        const apiError = toApiError(error);
+        if (apiError.code === 'INTERNAL') {
+          console.error('cron renew-watch failed', error instanceof Error ? error.message : error);
+        }
+        return errorResponse(apiError);
+      }
     },
   };
 }

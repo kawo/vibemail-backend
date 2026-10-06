@@ -17,6 +17,8 @@ export interface AppDeps {
   supabaseUrl: string;
   frontendUrl: string;
   pubsubVerificationToken: string | undefined;
+  /** `CRON_SECRET`; the cron handler fails closed when it is missing (CONTRACT.md §4.6). */
+  cronSecret: string | undefined;
   waitUntil: (promise: Promise<unknown>) => void;
   now: () => Date;
   log: (message: string, error?: unknown) => void;
@@ -39,6 +41,7 @@ export function depsFromEnv(env: NodeJS.ProcessEnv = process.env): AppDeps {
     frontendUrl: requireEnv('FRONTEND_URL', env),
     // Optional here: the webhook fails closed itself when it is missing (CONTRACT.md §4.5).
     pubsubVerificationToken: env.GOOGLE_PUBSUB_VERIFICATION_TOKEN,
+    cronSecret: env.CRON_SECRET,
     waitUntil: (promise) => {
       waitUntil(promise);
     },

@@ -1,6 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AccountCredentials, TokenUpdate } from '../providers/provider';
-import { decryptToken, encryptToken } from './crypto';
+import { TokenDecryptionError, decryptToken, encryptToken } from './crypto';
 
 /**
  * Repository for the `users` table (CONTRACT.md §5.2). All SQL for it lives here, every
@@ -36,6 +36,12 @@ export interface ConnectedAccount {
   credentials: AccountCredentials;
 }
 
+/** A cron renewal candidate. `credentials` is null when the stored tokens cannot be decrypted. */
+export interface RenewalCandidate {
+  userId: string;
+  credentials: AccountCredentials | null;
+}
+
 export type UpsertResult = 'ok' | 'google_account_linked_elsewhere' | 'another_google_account_linked';
 
 export interface UsersRepository {
@@ -58,6 +64,11 @@ export interface UsersRepository {
    * or no refresh token.
    */
   findAccountByEmailUnscoped(email: string): Promise<ConnectedAccount | null>;
+  /**
+   * Unscoped, for the cron job only (§4.6, §5.3): every account with a refresh token whose
+   * `watch_expiration` is null or earlier than `watchExpiringBefore`.
+   */
+  listConnectedAccountsUnscoped(filter: { watchExpiringBefore: Date }): Promise<RenewalCandidate[]>;
   /** Revocation: clears both tokens and the expiry (§4.5, §4.6). */
   clearUserTokens(userId: string): Promise<void>;
 }
@@ -238,6 +249,27 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
       if (error) {
         throw new DatabaseError('users sync record', error);
       }
+    },
+
+    async listConnectedAccountsUnscoped({ watchExpiringBefore }) {
+      const { data, error } = await table()
+        .select('google_id, user_id, refresh_token, access_token, access_token_expires_at')
+        .not('refresh_token', 'is', null)
+        .or(`watch_expiration.is.null,watch_expiration.lt.${watchExpiringBefore.toISOString()}`)
+        .overrideTypes<UserTokenRow[], { merge: false }>();
+      if (error) {
+        throw new DatabaseError('users renewal candidates', error);
+      }
+      return (data ?? []).map((row) => {
+        try {
+          return { userId: row.user_id, credentials: credentialsOf(row) };
+        } catch (decryptError) {
+          if (decryptError instanceof TokenDecryptionError) {
+            return { userId: row.user_id, credentials: null };
+          }
+          throw decryptError;
+        }
+      });
     },
 
     async clearUserTokens(userId) {
