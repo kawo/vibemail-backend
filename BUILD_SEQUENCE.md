@@ -52,11 +52,16 @@
 
 ### 2. Gmail OAuth layer with token persistence listener
 **What:** Everything that gets Google tokens and keeps them current:
+- **Files.**
+  - `src/providers/gmail/auth.ts`: the `OAuth2Client`, refresh and token info, `verifyRefreshToken`, the unused-in-v1 `buildAuthorizationUrl` / `exchangeAuthorizationCode`, and `watch`. It has no DB access.
+  - `src/db/crypto.ts`: AES-256-GCM (CONTRACT.md §5.4).
+  - `src/db/users.ts`: the `users` repository, with `upsertConnectedUser`, `updateUserTokens`, `getUserCredentials` and `updateWatch`. It encrypts on write and decrypts on read.
+  - `src/services/connectAccount.ts`: the §4.1 orchestration (verify → upsert → watch, with the `onTokens` hook calling `updateUserTokens` immediately).
 - **Bearer auth.** `requireUser(request)` in `src/middleware` verifies `Authorization: Bearer <Supabase access token>` with `jsonwebtoken` against `JWT_SECRET` (HS256 only, `aud: 'authenticated'`, issuer checked) and yields `userId` and `email` (CONTRACT.md §3.1). There are no cookies and no anon key.
 - **Connect Gmail.** `POST /api/v1/auth/google/callback` (CONTRACT.md §4.1). The frontend has already run Supabase's Google sign-in with `access_type: 'offline'` and `prompt: 'consent'`, and posts the `providerRefreshToken` it received. The backend then:
   1. proves the token with one `refreshAccessToken()`;
   2. checks with token info that `gmail.modify`, `gmail.send` and `email` were granted, and that the Google account's email equals the bearer's email;
-  3. upserts `gmail_accounts` with the refresh token, access token, expiry and scopes;
+  3. upserts `users` on conflict `google_id` (token-info `sub`), with the encrypted refresh token, access token, expiry and scopes;
   4. calls `watch()`, then runs the initial full sync from unit 3. That sync is wired in once unit 3 exists; until then the step is a no-op.
 - **Client factory.** Builds a per-user `googleapis` `OAuth2Client` and seeds it with the stored `refresh_token`, `access_token` and `expiry_date`. The library reuses the access token until it is within 5 minutes of expiry (`eagerRefreshThresholdMillis`, default 300 000 ms), then refreshes.
 - **Persistence listener.** Registered on the client with `client.on('tokens', …)`. The library emits this event on every refresh, and the listener:
@@ -67,7 +72,7 @@
 - **Revocation.** A refresh that fails with `invalid_grant` is surfaced as `GMAIL_TOKEN_REVOKED`, and the stored access token and its expiry are cleared.
 
 **Verified:** OAuth completes, tokens are stored, and refresh works without mismatch. Concretely:
-- A connect request with a valid bearer and a valid refresh token returns `200` and leaves a `gmail_accounts` row with non-null `refresh_token`, `access_token` and `access_token_expires_at`.
+- A connect request with a valid bearer and a valid refresh token returns `200` and leaves a `users` row with non-null `refresh_token`, `access_token` and `access_token_expires_at`.
 - The same request is rejected:
   - with `401 UNAUTHENTICATED` when there is no bearer;
   - with `401 GMAIL_TOKEN_REVOKED` when the refresh token is bad;
@@ -77,7 +82,7 @@
   In each rejected case, no row is written.
 - With a stored access token more than 5 minutes from expiry, a Gmail call reuses it and makes no token-endpoint request.
 - With one within 5 minutes of expiry, the call triggers exactly one refresh, and the DB then holds the new `access_token` and its new expiry.
-- After any refresh, the refresh token held by the client is identical to the one in `gmail_accounts`, both when Google omits `refresh_token` from the response and when the `tokens` event delivers a rotated one.
+- After any refresh, the refresh token held by the client is identical to the one in `users`, both when Google omits `refresh_token` from the response and when the `tokens` event delivers a rotated one.
 - An `UPDATE` that sets `access_token` with a null `access_token_expires_at` is rejected by the `CHECK` constraint.
 
 ### 3. Sync and read layer
@@ -121,7 +126,7 @@
 ### 5. Send layer
 **What:** `POST /api/v1/messages/send` (CONTRACT.md §4.3):
 - **Validation.** Recipients must be valid addresses, at most 100 in total. CR/LF in any header is rejected to block header injection. At least one of `text`/`html` is required.
-- **MIME builder.** Lives in `src/providers/gmail/`, behind `sendMessage(OutgoingMessage)`. It produces an RFC 2822 message: `From` is the account email from `gmail_accounts.email`, the subject is RFC 2047-encoded, and the body is `multipart/alternative` when both text and HTML are given, a single part otherwise.
+- **MIME builder.** Lives in `src/providers/gmail/`, behind `sendMessage(OutgoingMessage)`. It produces an RFC 2822 message: `From` is the account email from `users.email`, the subject is RFC 2047-encoded, and the body is `multipart/alternative` when both text and HTML are given, a single part otherwise.
 - **Send.** `src/send` builds an `OutgoingMessage` and calls `MailProvider.sendMessage`. The Gmail implementation base64url-encodes the MIME into `raw` and passes `threadId`.
 - **Replies.** Gmail threads a reply only when the request carries the original `threadId`, the `In-Reply-To`/`References` headers follow RFC 2822, and the `Subject` matches. So for a reply the builder sets `In-Reply-To` and `References` from the stored original, derives the subject server-side (CONTRACT.md §4.3: `Re: <original subject>` unless it already starts with `Re:`, ignoring any client `subject`), and passes the original's `thread_id`.
 - **Store.** The sent message is fetched back with `getMessage` and upserted through unit 3's parser, then returned as `201 { message }`.

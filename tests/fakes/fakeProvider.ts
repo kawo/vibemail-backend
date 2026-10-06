@@ -214,6 +214,7 @@ export function createFakeProviderFactory(
         return options.grant;
       }
       return {
+        accountId: 'google-sub-1',
         email: 'me@example.com',
         scopes: ['gmail.modify', 'gmail.send', 'email'],
         credentials: {

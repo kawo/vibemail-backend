@@ -66,6 +66,8 @@ export type OnTokens = (update: TokenUpdate) => Promise<void>;
 
 /** Result of proving a grant: identity, granted scopes and fresh credentials. */
 export interface VerifiedGrant {
+  /** The provider's stable account ID (Gmail: token-info `sub`, stored as `google_id`), or null if not disclosed. */
+  accountId: string | null;
   /** The account's email, or null if the email scope was not granted. */
   email: string | null;
   scopes: string[];
