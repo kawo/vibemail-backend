@@ -37,13 +37,12 @@ npx jest tests/unit/foo.test.ts     # single file
 npx jest -t "name of test"          # single test by name
 npm run typecheck                   # tsc -p tsconfig.check.json (src/, api/, tests/); `npm run build` runs the same
 npm run dev                         # vercel dev: local preview of api/
-supabase start                      # local Postgres/Auth for integration tests
-supabase db reset                   # re-apply supabase/migrations
+npx jest tests/integration          # integration tests against the dev/test Supabase project in .env (never production)
 npm run db:types                    # schema session only: regenerate src/types/database.ts from the linked project
 npm run db:push                     # pushes migrations to the hosted project; only after Gate 1 (CONTRACT.md §6)
 ```
 
-`--runInBand` is required because the integration tests share one local database. A run counts as passing only when `numFailedTests`, `numPendingTests` and `numTodoTests` are all 0 in `--json` output. A leftover `.only` surfaces as pending tests.
+`--runInBand` is required because the integration tests share one database: the dev/test project in `.env`. They create and delete `@vibemail.test` auth users there, and they need the schema branch's migration applied to that project. A run counts as passing only when `numFailedTests`, `numPendingTests` and `numTodoTests` are all 0 in `--json` output. A leftover `.only` surfaces as pending tests.
 
 ## The two-session architecture
 
