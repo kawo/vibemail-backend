@@ -195,6 +195,8 @@ describe('Gmail factory', () => {
 
   it('reports methods of later units as not yet built', async () => {
     const provider = createGmailProviderFactory(config).forAccount(creds, jest.fn());
-    await expect(provider.getMessage('x')).rejects.toThrow(/unit 3/);
+    await expect(
+      provider.sendMessage({ from: 'me@example.com', to: ['you@example.com'], subject: 's', text: 't' }),
+    ).rejects.toThrow(/unit 5/);
   });
 });

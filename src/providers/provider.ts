@@ -90,6 +90,7 @@ export interface ProviderMessage {
   /** The provider's own label or folder IDs. */
   labels: string[];
   isRead: boolean;
+  isStarred: boolean;
   inInbox: boolean;
   receivedAt: Date;
   sizeBytes: number;
@@ -183,8 +184,8 @@ export interface MailProvider {
 export interface MailProviderFactory {
   readonly providerId: string;
 
-  /** The provider's label IDs for the inbox and unread state, for applying label deltas. */
-  readonly wellKnownLabels: { readonly inbox: string; readonly unread: string };
+  /** The provider's label IDs for inbox, unread and starred state, for applying label deltas. */
+  readonly wellKnownLabels: { readonly inbox: string; readonly unread: string; readonly starred: string };
 
   /** Binds a provider to one mailbox. `onTokens` persists every refresh. */
   forAccount(credentials: AccountCredentials, onTokens: OnTokens): MailProvider;

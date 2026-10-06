@@ -17,14 +17,18 @@ import {
   type GmailAuthConfig,
   bindAccount,
   buildAuthorizationUrl,
+  toProviderError,
   exchangeAuthorizationCode,
   refreshBoundAccessToken,
   verifyRefreshToken,
   watchInbox,
 } from './auth';
+import { google, type gmail_v1 } from 'googleapis';
+import { parseGmailMessage } from './messages';
 
 export const GMAIL_INBOX_LABEL = 'INBOX';
 export const GMAIL_UNREAD_LABEL = 'UNREAD';
+export const GMAIL_STARRED_LABEL = 'STARRED';
 
 /** Gmail history IDs are unsigned 64-bit integers with gaps; compare them as BigInt. */
 export function compareHistoryIds(a: SyncCursor, b: SyncCursor): -1 | 0 | 1 {
@@ -37,8 +41,12 @@ function notYetBuilt(method: string, unit: number): never {
   throw new ProviderError('upstream', `GmailMailProvider.${method} is built in BUILD_SEQUENCE.md unit ${unit}`);
 }
 
+/** Gmail caps `maxResults` for `messages.list` at 500. */
+const LIST_PAGE_MAX = 500;
+
 export class GmailMailProvider implements MailProvider {
   private readonly bound: BoundOAuthClient;
+  private readonly gmail: gmail_v1.Gmail;
 
   constructor(
     private readonly config: GmailAuthConfig,
@@ -46,14 +54,48 @@ export class GmailMailProvider implements MailProvider {
     onTokens: OnTokens,
   ) {
     this.bound = bindAccount(config, credentials, onTokens);
+    this.gmail = google.gmail({ version: 'v1', auth: this.bound.client });
   }
 
-  async listInboxMessageIds(_max: number): Promise<string[]> {
-    return notYetBuilt('listInboxMessageIds', 3);
+  /** Runs a Gmail call, then waits for any token refresh it caused to be persisted. */
+  private async call<T>(context: string, run: () => Promise<T>): Promise<T> {
+    try {
+      const result = await run();
+      await this.bound.pendingWrites();
+      return result;
+    } catch (error) {
+      throw toProviderError(error, context);
+    }
   }
 
-  async getMessage(_id: string): Promise<ProviderMessage> {
-    return notYetBuilt('getMessage', 3);
+  /** Newest-first INBOX IDs, paging with `pageToken` until `max` IDs are collected or the inbox is exhausted. */
+  async listInboxMessageIds(max: number): Promise<string[]> {
+    const ids: string[] = [];
+    let pageToken: string | undefined;
+    do {
+      const { data } = await this.call('messages.list', () =>
+        this.gmail.users.messages.list({
+          userId: 'me',
+          labelIds: ['INBOX'],
+          maxResults: Math.min(max - ids.length, LIST_PAGE_MAX),
+          ...(pageToken ? { pageToken } : {}),
+        }),
+      );
+      for (const message of data.messages ?? []) {
+        if (message.id && ids.length < max) {
+          ids.push(message.id);
+        }
+      }
+      pageToken = data.nextPageToken ?? undefined;
+    } while (pageToken && ids.length < max);
+    return ids;
+  }
+
+  async getMessage(id: string): Promise<ProviderMessage> {
+    const { data } = await this.call('messages.get', () =>
+      this.gmail.users.messages.get({ userId: 'me', id, format: 'full' }),
+    );
+    return parseGmailMessage(data);
   }
 
   async listChanges(_since: SyncCursor, _pageToken?: string): Promise<ChangePage> {
@@ -84,7 +126,7 @@ export class GmailMailProvider implements MailProvider {
 export function createGmailProviderFactory(config: GmailAuthConfig): MailProviderFactory {
   return {
     providerId: 'gmail',
-    wellKnownLabels: { inbox: GMAIL_INBOX_LABEL, unread: GMAIL_UNREAD_LABEL },
+    wellKnownLabels: { inbox: GMAIL_INBOX_LABEL, unread: GMAIL_UNREAD_LABEL, starred: GMAIL_STARRED_LABEL },
     forAccount: (credentials: AccountCredentials, onTokens: OnTokens): MailProvider =>
       new GmailMailProvider(config, credentials, onTokens),
     verifyRefreshToken: (refreshToken: string): Promise<VerifiedGrant> => verifyRefreshToken(config, refreshToken),

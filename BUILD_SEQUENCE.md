@@ -88,38 +88,38 @@
 ### 3. Sync and read layer
 **What:** Gets mail from Gmail into the `messages` table and reads it back out as `MessageDTO`s (CONTRACT.md §4.2, §5.1). Its parts:
 - **Parser.** Lives in `src/providers/gmail/`, behind `getMessage`. It is a pure function that turns a Gmail `format=full` message into a `ProviderMessage`: it matches headers case-insensitively, walks MIME parts recursively, base64url-decodes `text/plain` and `text/html`, collects attachment metadata, converts `internalDate` from epoch-ms, and derives `isRead` from the `UNREAD` label. `src/sync` then maps `ProviderMessage` to the `messages` row 1:1.
-- **Initial (full) sync.** `listInboxMessageIds(50)` is called once with no paging; Gmail returns IDs newest first. Then `getMessage` is called for each ID, each row is upserted on `(user_id, gmail_id)`, and `last_history_id` is set from the newest message.
-- **Incremental sync.** `listChanges` from `last_history_id`, with a fallback to full sync when it rejects with `cursor_expired` (Gmail 404).
+- **Initial (full) sync.** `src/sync/index.ts`. `listInboxMessageIds(50)` pages with `pageToken` until 50 IDs are collected; Gmail returns IDs newest first. Then `getMessage` is called for each ID, each row is upserted on `(user_id, gmail_id)`, and `users.history_id` is set from the newest message's `historyId` (`messages.list` carries none). A message whose `get` returns 404 is skipped.
+- **Incremental sync.** `listChanges` from `history_id`, with a fallback to full sync when it rejects with `cursor_expired` (Gmail 404).
 - **Read side.** A repository query that returns INBOX rows ordered `(internal_date DESC, gmail_id DESC)` with keyset cursor pagination, mapped to `MessageDTO`. It never calls Gmail.
 - **Triggers.** Sync is push-driven only (CONTRACT.md §3.5): the full sync runs at connect (unit 2) and on the webhook's fallback, and the incremental sync runs from the webhook (unit 4). Nothing polls Gmail.
 
 **Verified:** Initial sync fetches 50 messages, the objects match the contract model, and incremental sync applies only the changes since the last sync. Concretely:
 - Against an inbox holding more than 50 messages, a first sync stores exactly the 50 newest.
 - Every stored row, and the `MessageDTO` read back from it, matches CONTRACT.md §5.1 / §3.4 field for field, with correct types and nulls. This is checked against a recorded fixture that includes nested multipart and an attachment.
-- **Incremental sync.** A second sync calls `history.list` with `startHistoryId` equal to the stored `last_history_id`. It then applies exactly the recorded changes and nothing else:
+- **Incremental sync.** A second sync calls `history.list` with `startHistoryId` equal to the stored `history_id`. It then applies exactly the recorded changes and nothing else:
   - one added message is fetched and inserted;
   - one deleted message's row is removed;
   - a removed `UNREAD` label flips `is_read` to `true`;
   - a `messagesAdded` entry whose `get` returns 404 is skipped without failing the sync;
   - an `INBOX` label added to a message that isn't stored causes one `get` and an insert with its full label set.
 
-  It makes no `messages.list` call, and `last_history_id` advances to the response's `historyId`.
-- **404 fallback.** When `history.list` returns 404, the sync falls back to a full sync (the 50 newest), and `last_history_id` is reset from the newest message.
+  It makes no `messages.list` call, and `history_id` advances to the response's `historyId`.
+- **404 fallback.** When `history.list` returns 404, the sync falls back to a full sync (the 50 newest), and `history_id` is reset from the newest message.
 - **No polling.** Listing messages through the read side, with a fake `MailProvider` that throws on any call, succeeds and makes zero Gmail calls.
 
 ### 4. Pub/Sub webhook receiver
 **What:** `POST /webhook/gmail` (CONTRACT.md §4.5; function file `api/webhook/gmail.ts`, reached through a `vercel.json` rewrite) together with watch registration and renewal:
 - **Authentication.** Compares the `?token=` query parameter to `GOOGLE_PUBSUB_VERIFICATION_TOKEN` in constant time, and fails closed if the variable is unset.
 - **Decoding.** Base64url-decodes `message.data` into `{ emailAddress, historyId }` and looks up the account by email.
-- **Delta.** If the notification's `historyId` is not newer than the stored `last_history_id`, it acks and makes no Gmail calls. Otherwise it runs unit 3's incremental sync from the **stored** `last_history_id`. The notification's ID is the mailbox's new state, not the start point.
-- **Concurrency.** `last_history_id` only ever advances, under a per-user advisory lock, so webhook and list syncs can't clobber each other.
+- **Delta.** If the notification's `historyId` is not newer than the stored `history_id`, it acks and makes no Gmail calls. Otherwise it runs unit 3's incremental sync from the **stored** `history_id`. The notification's ID is the mailbox's new state, not the start point.
+- **Concurrency.** `history_id` only ever advances, under a per-user advisory lock, so webhook and list syncs can't clobber each other.
 - **Acks.** `204` acks. Only retryable failures return non-2xx, which makes Pub/Sub redeliver.
 - **Watch.** `watch()` is called after the OAuth callback. Daily renewal is a separate cron job (`GET /api/cron/renew-watches`, CONTRACT.md §4.6), with its logic in `src/cron`; user requests never call `watch()`.
 - **Cron renewal.** The cron logic checks the `CRON_SECRET` bearer and fails closed if the secret is unset. It renews every connected account with a concurrency limit of 5, isolates failures per account, and clears tokens on `invalid_grant`.
 
 **Verified:** A notification fetches the correct delta through history ID. Concretely:
-- Given a stored `last_history_id = H` and a notification carrying `historyId = H2 > H`, the receiver calls `history.list` with `startHistoryId = H`, never `H2`.
-- It applies exactly the adds, deletes and label changes recorded after `H`, and leaves `last_history_id` advanced (not regressed).
+- Given a stored `history_id = H` and a notification carrying `historyId = H2 > H`, the receiver calls `history.list` with `startHistoryId = H`, never `H2`.
+- It applies exactly the adds, deletes and label changes recorded after `H`, and leaves `history_id` advanced (not regressed).
 - A replayed notification with `historyId ≤ H` makes zero Gmail calls and returns `204`.
 - The renewal job, given three accounts where one throws `invalid_grant`, renews the other two, clears the third's tokens, and reports `{ renewed: 2, revoked: 1, failed: 0 }`.
 

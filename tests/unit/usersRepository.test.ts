@@ -66,7 +66,7 @@ describe('users repository (CONTRACT.md §5.2–§5.4)', () => {
     const upsert = ops.find((o) => o.kind === 'upsert');
     expect(upsert?.onConflict).toBe('google_id');
     const values = upsert?.values ?? {};
-    expect(values).toMatchObject({ google_id: 'google-123', user_id: 'user-1', last_history_id: null });
+    expect(values).toMatchObject({ google_id: 'google-123', user_id: 'user-1', history_id: null });
     expect(values.refresh_token).not.toBe('refresh-plain');
     expect(decryptToken(String(values.refresh_token), key)).toBe('refresh-plain');
     expect(decryptToken(String(values.access_token), key)).toBe('access-plain');

@@ -1,46 +1,13 @@
-import type { ConnectedUserInput, UpsertResult, UsersRepository } from '../../src/db/users';
 import { TokenDecryptionError } from '../../src/db/crypto';
 import { GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE } from '../../src/providers/gmail/auth';
-import { type AccountCredentials, type TokenUpdate, type VerifiedGrant, ProviderError } from '../../src/providers/provider';
+import { type VerifiedGrant, ProviderError } from '../../src/providers/provider';
 import {
   connectGmailAccount,
   providerForUser,
   refreshUserAccessToken,
 } from '../../src/services/gmailAccount';
-import { createFakeProviderFactory } from '../fakes/fakeProvider';
-
-class MemoryUsers implements UsersRepository {
-  rows = new Map<string, ConnectedUserInput & { watch?: Date }>();
-  tokenWrites: Array<[string, TokenUpdate]> = [];
-  upsertResult: UpsertResult = 'ok';
-  cleared: string[] = [];
-  throwOnRead: Error | null = null;
-
-  async upsertConnectedUser(input: ConnectedUserInput): Promise<UpsertResult> {
-    if (this.upsertResult === 'ok') {
-      this.rows.set(input.userId, input);
-    }
-    return this.upsertResult;
-  }
-  async updateUserTokens(userId: string, update: TokenUpdate): Promise<void> {
-    this.tokenWrites.push([userId, update]);
-  }
-  async getUserCredentials(userId: string): Promise<AccountCredentials | null> {
-    if (this.throwOnRead) {
-      throw this.throwOnRead;
-    }
-    return this.rows.get(userId)?.credentials ?? null;
-  }
-  async updateWatch(userId: string, expiresAt: Date): Promise<void> {
-    const row = this.rows.get(userId);
-    if (row) {
-      row.watch = expiresAt;
-    }
-  }
-  async clearUserTokens(userId: string): Promise<void> {
-    this.cleared.push(userId);
-  }
-}
+import { createFakeProviderFactory, cursor, fakeMessage } from '../fakes/fakeProvider';
+import { MemoryMessages, MemoryUsers } from '../fakes/memoryRepos';
 
 const goodGrant: VerifiedGrant = {
   accountId: 'google-123',
@@ -53,8 +20,9 @@ const input = { userId: 'user-1', claimsEmail: 'me@example.com', providerRefresh
 function setup(grant: VerifiedGrant = goodGrant) {
   const { factory, box } = createFakeProviderFactory(undefined, { grant });
   const users = new MemoryUsers();
+  const messages = new MemoryMessages();
   const log = jest.fn();
-  return { deps: { factory, users, log }, users, box, log };
+  return { deps: { factory, users, messages, log }, users, messages, box, log };
 }
 
 describe('connectGmailAccount (CONTRACT.md §4.1)', () => {
@@ -66,7 +34,24 @@ describe('connectGmailAccount (CONTRACT.md §4.1)', () => {
     const row = users.rows.get('user-1');
     expect(row).toMatchObject({ googleId: 'google-123', userId: 'user-1', credentials: goodGrant.credentials });
     expect(row?.watch).toEqual(result.watchExpiration);
-    expect(box.calls.map((c) => c.method)).toEqual(['watch']);
+    expect(result.initialSync).toBe('completed');
+    expect(box.calls.map((c) => c.method)).toEqual(['watch', 'listInboxMessageIds']);
+  });
+
+  it('runs the initial sync after storing tokens (step 8)', async () => {
+    const { deps, users, messages, box } = setup();
+    box.messages.set('m1', fakeMessage({ id: 'm1', syncCursor: cursor(77) }));
+    await expect(connectGmailAccount(deps, input)).resolves.toMatchObject({ initialSync: 'completed' });
+    expect(messages.forUser('user-1').map((r) => r.gmail_id)).toEqual(['m1']);
+    expect(users.rows.get('user-1')?.historyId).toBe('77');
+  });
+
+  it('still succeeds when the initial sync fails, leaving history_id null', async () => {
+    const { deps, users, box, log } = setup();
+    box.failNext.set('listInboxMessageIds', new ProviderError('upstream', 'boom'));
+    await expect(connectGmailAccount(deps, input)).resolves.toMatchObject({ initialSync: 'failed' });
+    expect(users.rows.get('user-1')?.historyId).toBeNull();
+    expect(log).toHaveBeenCalled();
   });
 
   it('maps a revoked refresh token to GMAIL_TOKEN_REVOKED without writing', async () => {

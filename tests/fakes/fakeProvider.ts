@@ -15,6 +15,7 @@ import {
 
 export const FAKE_INBOX = 'INBOX';
 export const FAKE_UNREAD = 'UNREAD';
+export const FAKE_STARRED = 'STARRED';
 
 export const cursor = (value: number | string): SyncCursor => String(value) as SyncCursor;
 
@@ -55,6 +56,7 @@ export function fakeMessage(overrides: Partial<ProviderMessage> & { id: string }
     threadId: overrides.id,
     labels,
     isRead: !labels.includes(FAKE_UNREAD),
+    isStarred: labels.includes(FAKE_STARRED),
     inInbox: labels.includes(FAKE_INBOX),
     receivedAt: new Date('2026-10-01T12:00:00.000Z'),
     sizeBytes: 1024,
@@ -110,6 +112,7 @@ class FakeMailProvider implements MailProvider {
       ...message,
       labels,
       isRead: !labels.includes(FAKE_UNREAD),
+      isStarred: labels.includes(FAKE_STARRED),
       inInbox: labels.includes(FAKE_INBOX),
     });
     return { labels };
@@ -205,7 +208,7 @@ export function createFakeProviderFactory(
 ) {
   const factory = {
     providerId: 'fake',
-    wellKnownLabels: { inbox: FAKE_INBOX, unread: FAKE_UNREAD },
+    wellKnownLabels: { inbox: FAKE_INBOX, unread: FAKE_UNREAD, starred: FAKE_STARRED },
     forAccount(_credentials: AccountCredentials, onTokens: OnTokens): MailProvider {
       return new FakeMailProvider(box, onTokens);
     },

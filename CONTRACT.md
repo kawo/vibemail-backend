@@ -48,7 +48,7 @@ The project is complete when **every** item below is true and verifiable.
    - a token within 5 minutes of expiry is refreshed, and the new token and expiry are persisted;
    - writing an access token without an expiry is rejected by the DB.
 10. The webhook is tested for these cases:
-    - **Valid notification:** applies exactly the history delta since the stored `last_history_id`.
+    - **Valid notification:** applies exactly the history delta since the stored `history_id`.
     - **Duplicate or stale notification:** a notification whose `historyId` is ≤ the stored one makes no Gmail calls.
     - **Bad or missing `token` query parameter:** rejected with `401`.
     - **Unknown mailbox:** acknowledged without any Gmail call.
@@ -158,20 +158,21 @@ interface MessageDTO {
   threadId: string;
   labelIds: string[];
   isRead: boolean;
+  isStarred: boolean;
   snippet: string;
   historyId: string;
   internalDate: string;          // ISO-8601
   sizeEstimate: number;
   subject: string | null;
   fromAddress: string;
-  toAddresses: string[];
+  toAddress: string[];
   ccAddresses: string[];
   bccAddresses: string[];
   rfc822MessageId: string | null;
   inReplyTo: string | null;
   references: string | null;
   dateHeader: string | null;
-  bodyText: string | null;
+  bodyPlain: string | null;
   bodyHtml: string | null;
   attachments: AttachmentMeta[];
   syncedAt: string;              // ISO-8601
@@ -180,19 +181,19 @@ interface MessageDTO {
 
 ### 3.5 Sync procedure
 
-The procedure is shared by the connect endpoint (§4.1) and the webhook (§4.5); no other code path reads mail from Gmail. It runs under `pg_advisory_xact_lock(hashtext(user_id::text))`, and `last_history_id` only ever advances (§4.5, step 5).
+The procedure is shared by the connect endpoint (§4.1) and the webhook (§4.5); no other code path reads mail from Gmail. It runs under `pg_advisory_xact_lock(hashtext(user_id::text))`, and `history_id` only ever advances (§4.5, step 5).
 
-- **Full sync** (when `last_history_id` is `null`, or on the 404 fallback): `users.messages.list({ labelIds: ['INBOX'], maxResults: 50 })`, a single page with no further paging, so at most the 50 most recent INBOX messages. Then `users.messages.get({ format: 'full' })` each one, upsert it, and set `last_history_id` from the newest message.
-- **Incremental sync** (otherwise): `users.history.list({ startHistoryId: last_history_id, historyTypes: ['messageAdded','messageDeleted','labelAdded','labelRemoved'] })`, paging until done.
+- **Full sync** (when `history_id` is `null`, or on the 404 fallback): `users.messages.list({ labelIds: ['INBOX'], maxResults: 50 })`, paging with `pageToken` until 50 IDs are collected or the inbox is exhausted, so at most the 50 most recent INBOX messages. Then `users.messages.get({ format: 'full' })` each one and upsert it on `(user_id, gmail_id)`. A `get` that returns 404 is skipped. Finally, set `users.history_id` from the `historyId` of the newest fetched message, because `messages.list` responses carry no `historyId`.
+- **Incremental sync** (otherwise): `users.history.list({ startHistoryId: history_id, historyTypes: ['messageAdded','messageDeleted','labelAdded','labelRemoved'] })`, paging until done.
   - History records carry only message `id`s (and `threadId`), so every change is applied as follows:
   - `messagesAdded` → `get` + upsert.
     - If `get` returns **404** (the message was deleted before the sync reached it), skip it and delete any stored row for that `gmail_id`. This is not an error.
   - `messagesDeleted` → delete the row (a no-op if there is none).
   - `labelsAdded` / `labelsRemoved` carry only the label IDs that changed, not the message's full label set:
-    - **If the row exists:** apply the change to the stored `label_ids` (set union for added, set difference for removed), then recompute `is_read`.
+    - **If the row exists:** apply the change to the stored `label_ids` (set union for added, set difference for removed), then recompute `is_read` and `is_starred`.
     - **If the row does not exist** (e.g. an older message beyond the initial 50 was moved into `INBOX`): `get` the message and upsert it, so its full, current label set is stored. A 404 there is skipped as above.
   - Records are applied in the order returned, so a later record wins.
-  - Afterwards, set `last_history_id` to the response's `historyId`.
+  - Afterwards, set `history_id` to the response's `historyId`.
 - **404 fallback.** If `history.list` returns **404** (the start ID is outside the retained history window), fall back to a full sync. Through the provider abstraction this surfaces as `ProviderError` with `kind: 'cursor_expired'` (`src/providers/provider.ts`).
 - Both kinds set `users.last_synced_at = now()`.
 
@@ -246,9 +247,9 @@ interface ConnectGmailRequest {
    - `scopes`;
    - `access_token` and `access_token_expires_at` (from the refreshed credentials' `expiry_date`), written as a pair (§3.1).
 
-   On re-connect, reset `last_history_id` to `null` (this forces a full sync).
+   On re-connect, reset `history_id` to `null` (this forces a full sync).
 7. Call `MailProvider.watch()` (§4.5). If it fails, log the failure; it does not fail the request, and `watchExpiration` is `null`.
-8. Run the initial **full sync** (§3.5). If it fails, log the failure; it does not fail the request, and `initialSync` is `'failed'`. `last_history_id` then stays `null`, so the next push notification runs the full sync instead.
+8. Run the initial **full sync** (§3.5). If it fails, log the failure; it does not fail the request, and `initialSync` is `'failed'`. `history_id` then stays `null`, so the next push notification runs the full sync instead.
 
 The endpoint is idempotent: calling it again with a valid token for the same user overwrites the row.
 
@@ -480,11 +481,11 @@ interface PubSubPushBody {
 2. Decode `message.data` into `{ emailAddress, historyId }`. If it fails → `VALIDATION_FAILED`.
 3. Look up `users` by `email = emailAddress`. If there is no row, or no refresh token → **ack** (`204`) and make no Gmail call.
 4. **Delta rule:**
-   - If `historyId` ≤ `last_history_id` (compared as unsigned 64-bit integers via `BigInt`), the notification is a duplicate or arrived out of order → ack, no Gmail call.
-   - If the stored `last_history_id` is `null` (the initial sync at connect failed), run a full sync (§3.5).
-   - Otherwise run the incremental sync (§3.5) starting from the **stored** `last_history_id`, never from the notification's `historyId`. The notification's ID is the mailbox's *new* state and is used only as the "is there anything newer?" test.
+   - If `historyId` ≤ `history_id` (compared as unsigned 64-bit integers via `BigInt`), the notification is a duplicate or arrived out of order → ack, no Gmail call.
+   - If the stored `history_id` is `null` (the initial sync at connect failed), run a full sync (§3.5).
+   - Otherwise run the incremental sync (§3.5) starting from the **stored** `history_id`, never from the notification's `historyId`. The notification's ID is the mailbox's *new* state and is used only as the "is there anything newer?" test.
    - The 404 fallback to full sync applies here too.
-5. `last_history_id` only ever advances: `UPDATE … SET last_history_id = $new WHERE last_history_id IS NULL OR last_history_id::numeric < $new::numeric`. This makes concurrent syncs (webhook and list) safe. Each sync runs under `pg_advisory_xact_lock(hashtext(user_id::text))`.
+5. `history_id` only ever advances: `UPDATE … SET history_id = $new WHERE history_id IS NULL OR history_id::numeric < $new::numeric`. This makes concurrent syncs (webhook and list) safe. Each sync runs under `pg_advisory_xact_lock(hashtext(user_id::text))`.
 
 **Response**
 
@@ -575,20 +576,21 @@ Source is the Gmail `users.messages.get` response with `format=full` (the `Messa
 | `thread_id` | `text` | `string` | no | `m.threadId` |
 | `label_ids` | `text[]` | `string[]` | no (default `{}`) | `m.labelIds` (absent → `[]`) |
 | `is_read` | `boolean` | `boolean` | no | Derived: `!m.labelIds.includes('UNREAD')` |
+| `is_starred` | `boolean` | `boolean` | no | Derived: `m.labelIds.includes('STARRED')` |
 | `snippet` | `text` | `string` | no (default `''`) | `m.snippet` |
 | `history_id` | `text` | `string` | no | `m.historyId` (uint64, stored as text to avoid precision loss) |
 | `internal_date` | `timestamptz` | `string` (ISO) | no | `m.internalDate` (epoch-ms string → `new Date(Number(v))`) |
 | `size_estimate` | `integer` | `number` | no | `m.sizeEstimate` |
 | `subject` | `text` | `string \| null` | yes | `m.payload.headers[name="Subject"].value` |
 | `from_address` | `text` | `string` | no (default `''`) | `m.payload.headers[name="From"].value` (raw, e.g. `Ada <ada@x.io>`) |
-| `to_addresses` | `text[]` | `string[]` | no (default `{}`) | `m.payload.headers[name="To"].value`, split into addresses |
+| `to_address` | `text[]` | `string[]` | no (default `{}`) | `m.payload.headers[name="To"].value`, split into addresses. Named singular, but an array, because a message can have several recipients |
 | `cc_addresses` | `text[]` | `string[]` | no (default `{}`) | `m.payload.headers[name="Cc"].value`, split |
 | `bcc_addresses` | `text[]` | `string[]` | no (default `{}`) | `m.payload.headers[name="Bcc"].value`, split (present on sent mail only) |
 | `rfc822_message_id` | `text` | `string \| null` | yes | `m.payload.headers[name="Message-ID"].value` |
 | `in_reply_to` | `text` | `string \| null` | yes | `m.payload.headers[name="In-Reply-To"].value` |
 | `references` | `text` | `string \| null` | yes | `m.payload.headers[name="References"].value` |
 | `date_header` | `text` | `string \| null` | yes | `m.payload.headers[name="Date"].value` (raw, unparsed) |
-| `body_text` | `text` | `string \| null` | yes | First part (depth-first) with `mimeType = "text/plain"` and no `filename`: `body.data`, base64url-decoded as UTF-8 |
+| `body_plain` | `text` | `string \| null` | yes | First part (depth-first) with `mimeType = "text/plain"` and no `filename`: `body.data`, base64url-decoded as UTF-8. A single-part message (no `payload.parts`) uses `payload.body.data`, by `payload.mimeType` |
 | `body_html` | `text` | `string \| null` | yes | First part (depth-first) with `mimeType = "text/html"` and no `filename`: `body.data`, base64url-decoded as UTF-8 |
 | `attachments` | `jsonb` | `AttachmentMeta[]` | no (default `[]`) | Every part with a non-empty `filename` and `body.attachmentId`: `{ partId: part.partId, filename: part.filename, mimeType: part.mimeType, size: part.body.size, attachmentId: part.body.attachmentId }` |
 | `synced_at` | `timestamptz` | `string` | no | Server time of the last write from Gmail |
@@ -617,7 +619,7 @@ Constraints and indexes:
 | `scopes` | `text[]` | no | Granted scopes from token info |
 | `access_token` | `text`: ciphertext (§5.4) | yes | §4.1: the `access_token` from its proving refresh. Afterwards: `tokens.access_token` from the `'tokens'` event |
 | `access_token_expires_at` | `timestamptz` | yes | §4.1: that refresh's `expiry_date`. Afterwards: `tokens.expiry_date` (epoch ms) from the `'tokens'` event |
-| `last_history_id` | `text` | yes | Max `historyId` after the last successful sync; `null` forces a full sync |
+| `history_id` | `text` | yes | Max `historyId` after the last successful sync; `null` forces a full sync |
 | `last_synced_at` | `timestamptz` | yes | Server time |
 | `watch_expiration` | `timestamptz` | yes | `users.watch` response `expiration` (epoch-ms string); `null` means no active watch. Gmail's watch returns no resource ID, so none is stored |
 | `created_at` / `updated_at` | `timestamptz` | no | Server time |

@@ -1,5 +1,7 @@
 import { ApiError } from '../middleware/errors';
+import type { MessagesRepository } from '../db/messages';
 import type { UsersRepository } from '../db/users';
+import { runInitialSync } from '../sync';
 import { TokenDecryptionError } from '../db/crypto';
 import {
   type MailProvider,
@@ -14,6 +16,7 @@ import { REQUIRED_GMAIL_SCOPES } from '../providers/gmail/auth';
 export interface GmailAccountDeps {
   factory: MailProviderFactory;
   users: UsersRepository;
+  messages: MessagesRepository;
   log?: (message: string, error: unknown) => void;
 }
 
@@ -30,6 +33,8 @@ export interface ConnectResult {
   scopes: string[];
   /** Null when `watch()` failed; the failure is logged, not returned (CONTRACT.md §4.1 step 7). */
   watchExpiration: Date | null;
+  /** Step 8. On failure `history_id` stays null, so the next push notification runs the full sync. */
+  initialSync: 'completed' | 'failed';
 }
 
 const defaultLog = (message: string, error: unknown): void => {
@@ -76,9 +81,9 @@ function checkGrant(grant: VerifiedGrant, claimsEmail: string): { googleId: stri
 }
 
 /**
- * Connect Gmail, CONTRACT.md §4.1 steps 3–7: prove the refresh token, check identity and scopes,
- * store encrypted tokens (upsert on `google_id`), then register the push watch.
- * The initial full sync (step 8) is added in BUILD_SEQUENCE.md unit 3.
+ * Connect Gmail, CONTRACT.md §4.1 steps 3–8: prove the refresh token, check identity and scopes,
+ * store encrypted tokens (upsert on `google_id`), register the push watch, then run the
+ * initial full sync. Watch and sync failures are logged and never fail the connect.
  */
 export async function connectGmailAccount(deps: GmailAccountDeps, input: ConnectInput): Promise<ConnectResult> {
   const log = deps.log ?? defaultLog;
@@ -109,9 +114,10 @@ export async function connectGmailAccount(deps: GmailAccountDeps, input: Connect
     });
   }
 
+  const provider = deps.factory.forAccount(grant.credentials, persistTokensFor(deps.users, input.userId));
+
   let watchExpiration: Date | null = null;
   try {
-    const provider = deps.factory.forAccount(grant.credentials, persistTokensFor(deps.users, input.userId));
     const watch = await provider.watch();
     await deps.users.updateWatch(input.userId, watch.expiresAt);
     watchExpiration = watch.expiresAt;
@@ -119,7 +125,18 @@ export async function connectGmailAccount(deps: GmailAccountDeps, input: Connect
     log('watch registration failed after connect', error);
   }
 
-  return { email, scopes: grant.scopes, watchExpiration };
+  let initialSync: ConnectResult['initialSync'] = 'completed';
+  try {
+    await runInitialSync(
+      { provider, factory: deps.factory, messages: deps.messages, users: deps.users },
+      input.userId,
+    );
+  } catch (error) {
+    initialSync = 'failed';
+    log('initial sync failed after connect', error);
+  }
+
+  return { email, scopes: grant.scopes, watchExpiration, initialSync };
 }
 
 /**

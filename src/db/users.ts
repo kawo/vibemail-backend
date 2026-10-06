@@ -37,6 +37,10 @@ export interface UsersRepository {
   /** Decrypted credentials, or null when the user has no row or no refresh token. */
   getUserCredentials(userId: string): Promise<AccountCredentials | null>;
   updateWatch(userId: string, expiresAt: Date): Promise<void>;
+  /** The stored sync position (`history_id`), or null when a full sync is needed. */
+  getHistoryId(userId: string): Promise<string | null>;
+  /** Records a completed sync: sets `history_id` and `last_synced_at`. Callers enforce advance-only. */
+  recordSync(userId: string, historyId: string, syncedAt: Date): Promise<void>;
   /** Revocation: clears both tokens and the expiry (§4.5, §4.6). */
   clearUserTokens(userId: string): Promise<void>;
 }
@@ -98,7 +102,7 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
               ? credentials.accessTokenExpiresAt.toISOString()
               : null,
           // Re-connect forces a full sync (§4.1).
-          last_history_id: null,
+          history_id: null,
           updated_at: new Date().toISOString(),
         },
         { onConflict: 'google_id' },
@@ -147,6 +151,31 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
         .eq('user_id', userId);
       if (error) {
         throw new DatabaseError('users watch update', error);
+      }
+    },
+
+    async getHistoryId(userId) {
+      const { data, error } = await table()
+        .select('history_id')
+        .eq('user_id', userId)
+        .maybeSingle()
+        .overrideTypes<{ history_id: string | null } | null, { merge: false }>();
+      if (error) {
+        throw new DatabaseError('users history_id lookup', error);
+      }
+      return data?.history_id ?? null;
+    },
+
+    async recordSync(userId, historyId, syncedAt) {
+      const { error } = await table()
+        .update({
+          history_id: historyId,
+          last_synced_at: syncedAt.toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', userId);
+      if (error) {
+        throw new DatabaseError('users sync record', error);
       }
     },
 
