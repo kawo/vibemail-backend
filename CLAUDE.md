@@ -93,6 +93,6 @@ With the Supabase GitHub integration, merging into `main` runs the migration on 
   - Only `findAccountByEmailUnscoped` (webhook) and `listConnectedAccountsUnscoped` (cron) may skip that filter.
   - RLS is enabled with no policies, which closes the public Data API.
 - **History records carry only IDs:** label changes are deltas, applied to stored `label_ids`; an unknown message is fetched and stored; a 404 on `get` is skipped (CONTRACT.md §3.5).
-- **Sync state:** sync starts from the **stored** `last_history_id`, never from a notification's `historyId`. That value only advances, under a per-user advisory lock. A `history.list` 404 falls back to a full sync of the 50 newest messages.
+- **Sync state:** sync starts from the **stored** `history_id`, never from a notification's `historyId`. That value only advances, under a per-user advisory lock. A `history.list` 404 falls back to a full sync of the 50 newest messages.
 - **Webhook responses:** the webhook returns non-2xx only when a retry could help, because Pub/Sub redelivers on any non-2xx.
 - **Replies:** the server derives the reply subject (`Re: <original>`), because Gmail threads only when the subject, `threadId`, `In-Reply-To` and `References` all match.
