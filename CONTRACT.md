@@ -48,7 +48,7 @@ The project is complete when **every** item below is true and verifiable.
    - a token within 5 minutes of expiry is refreshed, and the new token and expiry are persisted;
    - writing an access token without an expiry is rejected by the DB.
 10. The webhook is tested for these cases:
-    - **Valid notification:** applies exactly the history delta since the stored `history_id`.
+    - **Valid notification:** returns `200` before any provider call, then applies exactly the history delta since the stored `history_id`, and saves the last `history.list` page's `historyId`.
     - **Duplicate or stale notification:** a notification whose `historyId` is ≤ the stored one makes no Gmail calls.
     - **Bad or missing `token` query parameter:** rejected with `401`.
     - **Unknown mailbox:** acknowledged without any Gmail call.
@@ -137,7 +137,7 @@ interface ErrorResponse {
 | `MESSAGE_NOT_FOUND` | 404 | false | The message ID is not in this user's mailbox (DB or Gmail). |
 | `GMAIL_RATE_LIMITED` | 429 | true | Gmail returned 429 or a 403 `rateLimitExceeded`/`userRateLimitExceeded`. Sets the `Retry-After` header (seconds). |
 | `GMAIL_UPSTREAM_ERROR` | 502 | true | Gmail returned 5xx or an unexpected 4xx. |
-| `SYNC_FAILED` | 502 | true | A sync (§3.5) run by the webhook failed for a reason other than auth or rate limit. |
+| `SYNC_FAILED` | 502 | true | Reserved. Webhook syncs run after the ack (§4.5), so their failures are logged, not returned. |
 | `INTERNAL` | 500 | false | Unhandled server or DB error. |
 
 ### 3.4 `MessageDTO`
@@ -478,35 +478,40 @@ interface PubSubPushBody {
    - Compare the `token` query parameter to it in constant time (`crypto.timingSafeEqual` on equal-length buffers). If it is missing or doesn't match → `UNAUTHENTICATED`.
    - There is no bypass. A local replay simply sends the same `?token=` from `.env`.
    - Known limit: the token sits in the URL, so it can appear in access logs. Rotate it by updating the env var and the subscription endpoint together.
-2. Decode `message.data` into `{ emailAddress, historyId }`. If it fails → `VALIDATION_FAILED`.
-3. Look up `users` by `email = emailAddress`. If there is no row, or no refresh token → **ack** (`204`) and make no Gmail call.
-4. **Delta rule:**
-   - If `historyId` ≤ `history_id` (compared as unsigned 64-bit integers via `BigInt`), the notification is a duplicate or arrived out of order → ack, no Gmail call.
+2. Decode `message.data` (base64 JSON) into `{ emailAddress, historyId }`. If it fails → `VALIDATION_FAILED`.
+3. **Ack immediately.** Return `200` with an empty body, and hand steps 4–6 to `waitUntil` from `@vercel/functions`. That keeps the function alive after the response, up to the function's `maxDuration`. Everything after the ack is background work:
+   - **Failures are logged and never retried by Pub/Sub**, because it has already been acked.
+   - Nothing is lost: the next notification catches up, because every sync starts from the **stored** `history_id`.
+   - Outside Vercel (tests, `vercel dev`), `waitUntil` is a no-op and the promise simply runs to completion.
+4. Look up `users` by `email = emailAddress` (`findAccountByEmailUnscoped`). If there is no row, or no refresh token, stop with no Gmail call.
+5. **Delta rule:**
+   - If `historyId` ≤ `history_id` (compared as unsigned 64-bit integers via `BigInt`), the notification is a duplicate or arrived out of order → stop, no Gmail call.
    - If the stored `history_id` is `null` (the initial sync at connect failed), run a full sync (§3.5).
    - Otherwise run the incremental sync (§3.5) starting from the **stored** `history_id`, never from the notification's `historyId`. The notification's ID is the mailbox's *new* state and is used only as the "is there anything newer?" test.
    - The 404 fallback to full sync applies here too.
-5. `history_id` only ever advances: `UPDATE … SET history_id = $new WHERE history_id IS NULL OR history_id::numeric < $new::numeric`. This makes concurrent syncs (webhook and list) safe. Each sync runs under `pg_advisory_xact_lock(hashtext(user_id::text))`.
+   - The saved `history_id` is the `historyId` of the **last `history.list` page**, saved only after every change was applied, never the notification's.
+6. `history_id` only ever advances: `UPDATE … SET history_id = $new WHERE history_id IS NULL OR history_id::numeric < $new::numeric`. This makes concurrent syncs (webhook and list) safe. Each sync runs under `pg_advisory_xact_lock(hashtext(user_id::text))`.
 
 **Response**
 
 | Outcome | Status | Body |
 |---|---|---|
-| Processed, duplicate, or unknown mailbox | `204 No Content` | none (acks the message) |
+| Valid token and body (acked; sync runs in the background) | `200 OK` | empty |
 | Error | per table below | §3.3 envelope |
 
-Pub/Sub redelivers on any non-2xx status, so only retryable failures return non-2xx.
+Only failures detected **before** the ack return non-2xx. Pub/Sub retries those, and they usually need a configuration fix.
 
-**Errors**
+**Errors** (before the ack only)
 
 | Code | HTTP | Trigger |
 |---|---|---|
 | `UNAUTHENTICATED` | 401 | Missing or wrong `token` query parameter. |
 | `VALIDATION_FAILED` | 400 | Body not JSON, or `message.data` does not decode to `{ emailAddress, historyId }`. |
-| `GMAIL_RATE_LIMITED` | 429 | Gmail rate limit during sync. Pub/Sub retries with backoff. |
-| `SYNC_FAILED` | 502 | Any other Gmail failure during sync. |
-| `INTERNAL` | 500 | DB error or an unexpected exception. |
+| `INTERNAL` | 500 | `GOOGLE_PUBSUB_VERIFICATION_TOKEN` not configured. |
 
-A `GMAIL_TOKEN_REVOKED` during a webhook sync is **acked** (`204`): retrying cannot succeed. The account's `refresh_token`, `access_token` and `access_token_expires_at` are then set to `null`, so later user requests return `GMAIL_NOT_CONNECTED`.
+**Background failures**, logged and not returned:
+- **Rate limits, Gmail errors and DB errors:** the sync stops without saving `history_id`, so the next notification retries the same delta.
+- **`invalid_grant`:** the account's `refresh_token`, `access_token` and `access_token_expires_at` are set to `null`, so later user requests return `GMAIL_NOT_CONNECTED`.
 
 ---
 

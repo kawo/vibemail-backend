@@ -14,6 +14,7 @@ import { decryptToken, encryptToken } from './crypto';
  */
 interface UserTokenRow {
   google_id: string;
+  history_id?: string | null;
   user_id: string;
   refresh_token: string | null;
   access_token: string | null;
@@ -25,6 +26,13 @@ export interface ConnectedUserInput {
   userId: string;
   email: string;
   scopes: string[];
+  credentials: AccountCredentials;
+}
+
+/** An account found without a user scope (webhook, CONTRACT.md §5.3). */
+export interface ConnectedAccount {
+  userId: string;
+  historyId: string | null;
   credentials: AccountCredentials;
 }
 
@@ -41,6 +49,11 @@ export interface UsersRepository {
   getHistoryId(userId: string): Promise<string | null>;
   /** Records a completed sync: sets `history_id` and `last_synced_at`. Callers enforce advance-only. */
   recordSync(userId: string, historyId: string, syncedAt: Date): Promise<void>;
+  /**
+   * Unscoped lookup by mailbox email, for the webhook only (§5.3). Null when there is no row
+   * or no refresh token.
+   */
+  findAccountByEmailUnscoped(email: string): Promise<ConnectedAccount | null>;
   /** Revocation: clears both tokens and the expiry (§4.5, §4.6). */
   clearUserTokens(userId: string): Promise<void>;
 }
@@ -71,6 +84,18 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
       throw new DatabaseError(`users lookup by ${column}`, error);
     }
     return data;
+  }
+
+  function credentialsOf(row: UserTokenRow): AccountCredentials | null {
+    if (row.refresh_token === null) {
+      return null;
+    }
+    const paired = row.access_token !== null && row.access_token_expires_at !== null;
+    return {
+      refreshToken: decryptToken(row.refresh_token, key),
+      accessToken: paired && row.access_token ? decryptToken(row.access_token, key) : null,
+      accessTokenExpiresAt: paired && row.access_token_expires_at ? new Date(row.access_token_expires_at) : null,
+    };
   }
 
   return {
@@ -134,15 +159,23 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
 
     async getUserCredentials(userId) {
       const row = await findBy('user_id', userId);
-      if (!row || row.refresh_token === null) {
+      return row ? credentialsOf(row) : null;
+    },
+
+    async findAccountByEmailUnscoped(email) {
+      const { data, error } = await table()
+        .select('google_id, user_id, history_id, refresh_token, access_token, access_token_expires_at')
+        .eq('email', email)
+        .maybeSingle()
+        .overrideTypes<UserTokenRow | null, { merge: false }>();
+      if (error) {
+        throw new DatabaseError('users lookup by email', error);
+      }
+      const credentials = data ? credentialsOf(data) : null;
+      if (!data || !credentials) {
         return null;
       }
-      const paired = row.access_token !== null && row.access_token_expires_at !== null;
-      return {
-        refreshToken: decryptToken(row.refresh_token, key),
-        accessToken: paired && row.access_token ? decryptToken(row.access_token, key) : null,
-        accessTokenExpiresAt: paired && row.access_token_expires_at ? new Date(row.access_token_expires_at) : null,
-      };
+      return { userId: data.user_id, historyId: data.history_id ?? null, credentials };
     },
 
     async updateWatch(userId, expiresAt) {

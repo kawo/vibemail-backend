@@ -5,6 +5,7 @@ import {
   type MailProviderFactory,
   type OnTokens,
   type OutgoingMessage,
+  type ProviderChange,
   type ProviderMessage,
   type SyncCursor,
   type TokenUpdate,
@@ -39,6 +40,32 @@ export function compareHistoryIds(a: SyncCursor, b: SyncCursor): -1 | 0 | 1 {
 
 function notYetBuilt(method: string, unit: number): never {
   throw new ProviderError('upstream', `GmailMailProvider.${method} is built in BUILD_SEQUENCE.md unit ${unit}`);
+}
+
+/** Flattens one Gmail history record into ordered changes. Records carry only IDs and label deltas. */
+export function historyToChanges(record: gmail_v1.Schema$History): ProviderChange[] {
+  const changes: ProviderChange[] = [];
+  for (const added of record.messagesAdded ?? []) {
+    if (added.message?.id) {
+      changes.push({ type: 'messageAdded', messageId: added.message.id });
+    }
+  }
+  for (const deleted of record.messagesDeleted ?? []) {
+    if (deleted.message?.id) {
+      changes.push({ type: 'messageDeleted', messageId: deleted.message.id });
+    }
+  }
+  for (const added of record.labelsAdded ?? []) {
+    if (added.message?.id) {
+      changes.push({ type: 'labelsAdded', messageId: added.message.id, labels: added.labelIds ?? [] });
+    }
+  }
+  for (const removed of record.labelsRemoved ?? []) {
+    if (removed.message?.id) {
+      changes.push({ type: 'labelsRemoved', messageId: removed.message.id, labels: removed.labelIds ?? [] });
+    }
+  }
+  return changes;
 }
 
 /** Gmail caps `maxResults` for `messages.list` at 500. */
@@ -98,8 +125,34 @@ export class GmailMailProvider implements MailProvider {
     return parseGmailMessage(data);
   }
 
-  async listChanges(_since: SyncCursor, _pageToken?: string): Promise<ChangePage> {
-    return notYetBuilt('listChanges', 3);
+  /** One page of `history.list` since `since`. A 404 means the cursor is too old: `cursor_expired`. */
+  async listChanges(since: SyncCursor, pageToken?: string): Promise<ChangePage> {
+    let data: gmail_v1.Schema$ListHistoryResponse;
+    try {
+      ({ data } = await this.call('history.list', () =>
+        this.gmail.users.history.list({
+          userId: 'me',
+          startHistoryId: since,
+          historyTypes: ['messageAdded', 'messageDeleted', 'labelAdded', 'labelRemoved'],
+          ...(pageToken ? { pageToken } : {}),
+        }),
+      ));
+    } catch (error) {
+      if (error instanceof ProviderError && error.kind === 'not_found') {
+        throw new ProviderError('cursor_expired', `history ${since} is outside the retained window`, {
+          cause: error,
+        });
+      }
+      throw error;
+    }
+    if (!data.historyId) {
+      throw new ProviderError('upstream', 'history.list response lacks historyId');
+    }
+    return {
+      changes: (data.history ?? []).flatMap(historyToChanges),
+      nextPageToken: data.nextPageToken ?? null,
+      cursor: data.historyId as SyncCursor,
+    };
   }
 
   async sendMessage(_message: OutgoingMessage): Promise<{ id: string; threadId: string }> {

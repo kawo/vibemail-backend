@@ -1,5 +1,5 @@
 import type { MessageRow, MessagesRepository } from '../../src/db/messages';
-import type { ConnectedUserInput, UpsertResult, UsersRepository } from '../../src/db/users';
+import type { ConnectedAccount, ConnectedUserInput, UpsertResult, UsersRepository } from '../../src/db/users';
 import type { AccountCredentials, TokenUpdate } from '../../src/providers/provider';
 
 export interface MemoryUserRow extends ConnectedUserInput {
@@ -47,6 +47,13 @@ export class MemoryUsers implements UsersRepository {
       row.lastSyncedAt = syncedAt;
     }
   }
+  async findAccountByEmailUnscoped(email: string): Promise<ConnectedAccount | null> {
+    const row = [...this.rows.values()].find((r) => r.email === email);
+    if (!row || this.cleared.includes(row.userId)) {
+      return null;
+    }
+    return { userId: row.userId, historyId: row.historyId, credentials: row.credentials };
+  }
   async clearUserTokens(userId: string): Promise<void> {
     this.cleared.push(userId);
   }
@@ -74,6 +81,25 @@ export class MemoryMessages implements MessagesRepository {
   async deleteMessage(userId: string, gmailId: string): Promise<void> {
     this.deleted.push([userId, gmailId]);
     this.rows.delete(MemoryMessages.key(userId, gmailId));
+  }
+  async getLabels(userId: string, gmailId: string): Promise<string[] | null> {
+    return this.rows.get(MemoryMessages.key(userId, gmailId))?.label_ids ?? null;
+  }
+  async updateLabels(
+    userId: string,
+    gmailId: string,
+    update: { labels: string[]; isRead: boolean; isStarred: boolean; syncedAt: Date },
+  ): Promise<void> {
+    const row = this.rows.get(MemoryMessages.key(userId, gmailId));
+    if (row) {
+      this.rows.set(MemoryMessages.key(userId, gmailId), {
+        ...row,
+        label_ids: update.labels,
+        is_read: update.isRead,
+        is_starred: update.isStarred,
+        synced_at: update.syncedAt.toISOString(),
+      });
+    }
   }
   forUser(userId: string): MessageRow[] {
     return [...this.rows.values()].filter((row) => row.user_id === userId);

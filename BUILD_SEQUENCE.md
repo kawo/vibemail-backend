@@ -113,14 +113,15 @@
 - **Decoding.** Base64url-decodes `message.data` into `{ emailAddress, historyId }` and looks up the account by email.
 - **Delta.** If the notification's `historyId` is not newer than the stored `history_id`, it acks and makes no Gmail calls. Otherwise it runs unit 3's incremental sync from the **stored** `history_id`. The notification's ID is the mailbox's new state, not the start point.
 - **Concurrency.** `history_id` only ever advances, under a per-user advisory lock, so webhook and list syncs can't clobber each other.
-- **Acks.** `204` acks. Only retryable failures return non-2xx, which makes Pub/Sub redeliver.
+- **Acks.** `src/webhook/gmail.ts` checks the token and decodes the body, then returns `200` at once and runs the sync inside `waitUntil` (`@vercel/functions`). Background failures are logged, not retried; the next notification catches up from the stored `history_id`.
 - **Watch.** `watch()` is called after the OAuth callback. Daily renewal is a separate cron job (`GET /api/cron/renew-watches`, CONTRACT.md §4.6), with its logic in `src/cron`; user requests never call `watch()`.
 - **Cron renewal.** The cron logic checks the `CRON_SECRET` bearer and fails closed if the secret is unset. It renews every connected account with a concurrency limit of 5, isolates failures per account, and clears tokens on `invalid_grant`.
 
 **Verified:** A notification fetches the correct delta through history ID. Concretely:
 - Given a stored `history_id = H` and a notification carrying `historyId = H2 > H`, the receiver calls `history.list` with `startHistoryId = H`, never `H2`.
 - It applies exactly the adds, deletes and label changes recorded after `H`, and leaves `history_id` advanced (not regressed).
-- A replayed notification with `historyId ≤ H` makes zero Gmail calls and returns `204`.
+- The response is `200`, and it is returned before any provider call.
+- A replayed notification with `historyId ≤ H` makes zero Gmail calls.
 - The renewal job, given three accounts where one throws `invalid_grant`, renews the other two, clears the third's tokens, and reports `{ renewed: 2, revoked: 1, failed: 0 }`.
 
 ### 5. Send layer

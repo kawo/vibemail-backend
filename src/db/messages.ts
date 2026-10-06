@@ -41,6 +41,14 @@ export interface MessagesRepository {
   /** Upserts rows on `(user_id, gmail_id)`. Every row must belong to `userId`. */
   upsertMessages(userId: string, rows: MessageRow[]): Promise<void>;
   deleteMessage(userId: string, gmailId: string): Promise<void>;
+  /** Stored labels of one message, or null when it is not stored. */
+  getLabels(userId: string, gmailId: string): Promise<string[] | null>;
+  /** Replaces a stored message's labels and the flags derived from them. */
+  updateLabels(
+    userId: string,
+    gmailId: string,
+    update: { labels: string[]; isRead: boolean; isStarred: boolean; syncedAt: Date },
+  ): Promise<void>;
 }
 
 export function createMessagesRepository(db: SupabaseClient): MessagesRepository {
@@ -55,6 +63,36 @@ export function createMessagesRepository(db: SupabaseClient): MessagesRepository
       const { error } = await db.from('messages').upsert(rows, { onConflict: 'user_id,gmail_id' });
       if (error) {
         throw new DatabaseError('messages upsert', error);
+      }
+    },
+
+    async getLabels(userId, gmailId) {
+      const { data, error } = await db
+        .from('messages')
+        .select('label_ids')
+        .eq('user_id', userId)
+        .eq('gmail_id', gmailId)
+        .maybeSingle()
+        .overrideTypes<{ label_ids: string[] } | null, { merge: false }>();
+      if (error) {
+        throw new DatabaseError('messages label lookup', error);
+      }
+      return data?.label_ids ?? null;
+    },
+
+    async updateLabels(userId, gmailId, update) {
+      const { error } = await db
+        .from('messages')
+        .update({
+          label_ids: update.labels,
+          is_read: update.isRead,
+          is_starred: update.isStarred,
+          synced_at: update.syncedAt.toISOString(),
+        })
+        .eq('user_id', userId)
+        .eq('gmail_id', gmailId);
+      if (error) {
+        throw new DatabaseError('messages label update', error);
       }
     },
 

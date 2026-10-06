@@ -1,5 +1,6 @@
 import type { GmailAuthConfig } from '../../src/providers/gmail/auth';
 import { GmailMailProvider } from '../../src/providers/gmail/provider';
+import { cursor } from '../fakes/fakeProvider';
 
 const config: GmailAuthConfig = {
   clientId: 'c',
@@ -74,5 +75,46 @@ describe('GmailMailProvider.getMessage', () => {
       throw { response: { status: 404 } };
     });
     await expect(provider.getMessage('gone')).rejects.toMatchObject({ kind: 'not_found' });
+  });
+});
+
+describe('GmailMailProvider.listChanges', () => {
+  it('requests history from the given cursor and maps records to ordered changes', async () => {
+    const { provider, calls } = providerWith(() => ({
+      data: {
+        historyId: '250',
+        nextPageToken: 'n2',
+        history: [
+          { id: '201', messagesAdded: [{ message: { id: 'a', threadId: 't' } }] },
+          { id: '202', messagesDeleted: [{ message: { id: 'b' } }] },
+          { id: '203', labelsAdded: [{ message: { id: 'c' }, labelIds: ['STARRED'] }] },
+          { id: '204', labelsRemoved: [{ message: { id: 'c' }, labelIds: ['UNREAD'] }] },
+        ],
+      },
+    }));
+    const page = await provider.listChanges(cursor('200'), 'p1');
+    expect(page).toEqual({
+      changes: [
+        { type: 'messageAdded', messageId: 'a' },
+        { type: 'messageDeleted', messageId: 'b' },
+        { type: 'labelsAdded', messageId: 'c', labels: ['STARRED'] },
+        { type: 'labelsRemoved', messageId: 'c', labels: ['UNREAD'] },
+      ],
+      nextPageToken: 'n2',
+      cursor: '250',
+    });
+    expect(calls[0]?.url).toContain('/gmail/v1/users/me/history');
+    expect(calls[0]?.params).toMatchObject({
+      startHistoryId: '200',
+      pageToken: 'p1',
+      historyTypes: ['messageAdded', 'messageDeleted', 'labelAdded', 'labelRemoved'],
+    });
+  });
+
+  it('maps a 404 to cursor_expired', async () => {
+    const { provider } = providerWith(() => {
+      throw { response: { status: 404 } };
+    });
+    await expect(provider.listChanges(cursor('1'))).rejects.toMatchObject({ kind: 'cursor_expired' });
   });
 });
