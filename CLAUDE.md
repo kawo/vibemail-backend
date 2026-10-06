@@ -88,6 +88,7 @@ With the Supabase GitHub integration, merging into `main` runs the migration on 
 - **Machine endpoints** are outside `/api/v1` and don't use the user JWT:
   - The Pub/Sub webhook is at **`/webhook/gmail`**, implemented in `api/webhook/gmail.ts` and reached through a `vercel.json` rewrite. It authenticates with a `?token=` query parameter equal to `GOOGLE_PUBSUB_VERIFICATION_TOKEN`, compared in constant time.
   - The cron job is at `/api/cron/renew-watches` and authenticates with the `CRON_SECRET` bearer.
+- **Account table:** `users`, keyed by `google_id` (the token-info `sub`), with a unique `user_id` linking it to the Supabase user. The connect upsert is `ON CONFLICT (google_id)` guarded by `user_id` (CONTRACT.md §5.2).
 - **Tenant isolation:** the service-role client bypasses RLS, so every user-scoped query lives in `src/db/` and filters on `user_id`.
   - Only `findAccountByEmailUnscoped` (webhook) and `listConnectedAccountsUnscoped` (cron) may skip that filter.
   - RLS is enabled with no policies, which closes the public Data API.
