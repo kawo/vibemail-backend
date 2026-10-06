@@ -21,11 +21,12 @@ export interface GmailAccountDeps {
 }
 
 export interface ConnectInput {
-  /** `sub` of the verified bearer token. */
+  /** `sub` from the verified OAuth `state` (CONTRACT.md §4.1b). */
   userId: string;
-  /** `email` claim of the verified bearer token. */
-  claimsEmail: string;
-  providerRefreshToken: string;
+  /** `email` from the verified OAuth `state`; the Google account must match it. */
+  expectedEmail: string;
+  /** Google's authorization code from the callback. */
+  code: string;
 }
 
 export interface ConnectResult {
@@ -60,13 +61,18 @@ export function persistTokensFor(users: UsersRepository, userId: string): OnToke
   return (update: TokenUpdate) => users.updateUserTokens(userId, update);
 }
 
-function checkGrant(grant: VerifiedGrant, claimsEmail: string): { googleId: string; email: string } {
-  if (!grant.email || !grant.accountId) {
-    throw new ApiError('GMAIL_NOT_CONNECTED', 'The email scope was not granted', {
-      details: { missingScopes: ['email'] },
+function checkGrant(grant: VerifiedGrant, expectedEmail: string): { googleId: string; email: string } {
+  if (!grant.credentials.refreshToken) {
+    throw new ApiError('GMAIL_NOT_CONNECTED', 'Google returned no refresh token', {
+      details: { reason: 'no_refresh_token' },
     });
   }
-  if (grant.email.toLowerCase() !== claimsEmail.toLowerCase()) {
+  if (!grant.email || !grant.accountId) {
+    throw new ApiError('GMAIL_NOT_CONNECTED', 'The email scope was not granted', {
+      details: { reason: 'missing_email_scope', missingScopes: ['email'] },
+    });
+  }
+  if (grant.email.toLowerCase() !== expectedEmail.toLowerCase()) {
     throw new ApiError('VALIDATION_FAILED', 'The Google account does not match the signed-in user', {
       details: { reason: 'EMAIL_MISMATCH' },
     });
@@ -74,27 +80,27 @@ function checkGrant(grant: VerifiedGrant, claimsEmail: string): { googleId: stri
   const missingScopes = REQUIRED_GMAIL_SCOPES.filter((scope) => !grant.scopes.includes(scope));
   if (missingScopes.length > 0) {
     throw new ApiError('GMAIL_NOT_CONNECTED', 'Required Gmail scopes were not granted', {
-      details: { missingScopes },
+      details: { reason: 'missing_gmail_scope', missingScopes },
     });
   }
   return { googleId: grant.accountId, email: grant.email };
 }
 
 /**
- * Connect Gmail, CONTRACT.md §4.1 steps 3–8: prove the refresh token, check identity and scopes,
- * store encrypted tokens (upsert on `google_id`), register the push watch, then run the
- * initial full sync. Watch and sync failures are logged and never fail the connect.
+ * Connect Gmail, CONTRACT.md §4.1b steps 3–8: exchange the authorization code, check identity
+ * and scopes, store encrypted tokens (upsert on `google_id`), register the push watch, then run
+ * the initial full sync. Watch and sync failures are logged and never fail the connect.
  */
 export async function connectGmailAccount(deps: GmailAccountDeps, input: ConnectInput): Promise<ConnectResult> {
   const log = deps.log ?? defaultLog;
 
   let grant: VerifiedGrant;
   try {
-    grant = await deps.factory.verifyRefreshToken(input.providerRefreshToken);
+    grant = await deps.factory.exchangeAuthorizationCode(input.code);
   } catch (error) {
     throw error instanceof ProviderError ? apiErrorFromProvider(error) : error;
   }
-  const { googleId, email } = checkGrant(grant, input.claimsEmail);
+  const { googleId, email } = checkGrant(grant, input.expectedEmail);
 
   const outcome = await deps.users.upsertConnectedUser({
     googleId,

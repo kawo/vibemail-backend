@@ -175,18 +175,14 @@ async function grantFromClient(
   if (!accessToken || !expiryDate) {
     throw new ProviderError('upstream', 'Google returned no access token');
   }
-  if (!refreshToken) {
-    throw new ProviderError(
-      'revoked',
-      'Google returned no refresh token; consent must use access_type=offline and prompt=consent',
-    );
-  }
   const info = await client.getTokenInfo(accessToken);
   return {
     accountId: info.sub ?? null,
     email: info.email ?? null,
     scopes: info.scopes,
-    credentials: { refreshToken, accessToken, accessTokenExpiresAt: new Date(expiryDate) },
+    // Empty when Google returned none (consent without access_type=offline / prompt=consent).
+    // Callers reject that as GMAIL_NOT_CONNECTED (CONTRACT.md §4.1b step 3).
+    credentials: { refreshToken: refreshToken ?? '', accessToken, accessTokenExpiresAt: new Date(expiryDate) },
   };
 }
 
@@ -202,10 +198,7 @@ export async function verifyRefreshToken(config: GmailAuthConfig, refreshToken: 
   }
 }
 
-/**
- * Consent URL for a backend-driven OAuth flow.
- * @remarks Not used in v1: the frontend signs in through Supabase (CONTRACT.md §3.1).
- */
+/** Consent URL for the backend OAuth flow (CONTRACT.md §4.1a). */
 export function buildAuthorizationUrl(
   config: GmailAuthConfig,
   options: { state: string; scopes: string[]; loginHint?: string },
@@ -220,10 +213,7 @@ export function buildAuthorizationUrl(
   });
 }
 
-/**
- * Exchanges an authorization code for tokens, then reads identity and scopes.
- * @remarks Not used in v1: the frontend signs in through Supabase (CONTRACT.md §3.1).
- */
+/** Exchanges an authorization code for tokens, then reads identity and scopes (CONTRACT.md §4.1b). */
 export async function exchangeAuthorizationCode(config: GmailAuthConfig, code: string): Promise<VerifiedGrant> {
   const client = createOAuthClient(config);
   try {

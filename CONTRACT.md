@@ -68,7 +68,7 @@ The project is complete when **every** item below is true and verifiable.
 
 ### 3.1 Authentication
 
-- **No cookies.** Every user-facing endpoint (§4.1–§4.4) requires `Authorization: Bearer <Supabase access token>`. The frontend gets this token by running Supabase's Google sign-in itself, so the backend never sees the OAuth redirect or the PKCE code verifier.
+- **No cookies.** Every `/api/v1` endpoint except the Google OAuth callback requires `Authorization: Bearer <Supabase access token>`. That includes `GET /api/v1/auth/google/start` (§4.1). The frontend gets the token from its own Supabase sign-in. The callback is a browser redirect from Google and can't carry a header, so it authenticates with the signed `state` issued by the start endpoint (§4.1).
   - **Verification.** The token is checked locally with `jsonwebtoken`, using `jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'], audience: 'authenticated', issuer: SUPABASE_URL + '/auth/v1' })`.
     - The `algorithms` allow-list is mandatory. It blocks `alg: none` and algorithm-confusion attacks.
     - **Prerequisite:** the Supabase project must sign user tokens with the legacy shared secret (HS256). A project switched to asymmetric signing keys would make every request fail `UNAUTHENTICATED`.
@@ -86,10 +86,12 @@ The project is complete when **every** item below is true and verifiable.
     - `refresh_token` is written only when Google returns a new one.
   - **Paired columns.** `access_token` and `access_token_expires_at` are always written together, or both set to `null`. `google-auth-library` treats a credential with no `expiry_date` as *never expiring*, so an access token stored without an expiry would never be refreshed. A DB `CHECK` enforces the pairing (§5.2).
   - **Revocation.** On `invalid_grant`, both access-token columns are set to `null`.
-- Required Google scopes: `https://www.googleapis.com/auth/gmail.modify`, `https://www.googleapis.com/auth/gmail.send` and `email`. Google's token info returns the account's `email` only when the `email` scope was granted, and §4.1 needs it. Supabase's Google provider normally requests `email`, but it must be present. The frontend starts sign-in with `signInWithOAuth({ provider: 'google', options: { scopes, queryParams: { access_type: 'offline', prompt: 'consent' } } })` so that Google returns a refresh token.
-- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` configure every `OAuth2Client`. The client is always constructed with the options object, `new OAuth2Client({ clientId, clientSecret, redirectUri })`, because the positional-argument form is deprecated in `google-auth-library` 11.
-- **Revocation detection.** A refresh rejected for a revoked or invalid refresh token surfaces as a `GaxiosError` with `response.data.error === 'invalid_grant'`. That check is the only trigger for `GMAIL_TOKEN_REVOKED`. `GOOGLE_REDIRECT_URI` must be registered on that Google OAuth client. The backend never performs an authorization-code exchange in v1, so the value is client configuration only.
-- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` must be the **same** OAuth client configured in the Supabase Google provider. Google only honours a refresh token for the client it was issued to.
+- **Gmail grant: backend OAuth.** The backend runs Google's authorization-code flow itself (§4.1): consent URL → `GET /api/v1/auth/google/callback` → code exchange. Supabase is used only for the user's own sign-in, not for Gmail tokens.
+- Required Google scopes: `openid`, `email`, `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/gmail.send`. The consent URL uses `access_type=offline` and `prompt=consent`, so that Google returns a refresh token. Google's token info returns the account's `email` and `sub` only when the `email` scope was granted.
+- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` configure every `OAuth2Client`.
+  - The client is always constructed with the options object, `new OAuth2Client({ clientId, clientSecret, redirectUri })`, because the positional-argument form is deprecated in `google-auth-library` 11.
+  - `GOOGLE_REDIRECT_URI` must be exactly `{origin}/api/v1/auth/google/callback`, and it must be registered as an authorized redirect URI on that Google OAuth client.
+- **Revocation detection.** A refresh rejected for a revoked or invalid refresh token surfaces as a `GaxiosError` with `response.data.error === 'invalid_grant'`. That check is the only trigger for `GMAIL_TOKEN_REVOKED`.
 
 ### 3.2 Format
 
@@ -130,7 +132,7 @@ interface ErrorResponse {
 
 | Code | HTTP | `retryable` | Meaning |
 |---|---|---|---|
-| `UNAUTHENTICATED` | 401 | false | No valid Supabase session, or the OAuth code exchange failed. |
+| `UNAUTHENTICATED` | 401 | false | Missing or invalid bearer token, or an invalid OAuth `state` (§4.1b). |
 | `GMAIL_NOT_CONNECTED` | 409 | false | The user has no `users` row, no refresh token, or is missing the required scopes. |
 | `GMAIL_TOKEN_REVOKED` | 401 | false | Google rejected the refresh token (`invalid_grant`). The user must sign in again. |
 | `VALIDATION_FAILED` | 400 | false | The request params or body failed validation. |
@@ -217,64 +219,63 @@ A missing required variable fails the function with `500 INTERNAL` and a log lin
 
 ## 4. Endpoint contracts
 
-### 4.1 Connect Gmail — `POST /api/v1/auth/google/callback`
+### 4.1 Connect Gmail — backend OAuth flow
 
-The frontend calls this once, right after its own Supabase Google sign-in completes, to hand the backend the Google refresh token. Supabase returns that token to the frontend once, as `session.provider_refresh_token`, and does not store it. The endpoint answers with JSON and never redirects.
+Two endpoints:
+- **Start** (`GET /api/v1/auth/google/start`): the frontend `fetch`es it with the bearer, then sends the browser to the returned URL.
+- **Callback** (`GET /api/v1/auth/google/callback`): Google redirects the browser there, and it redirects back to the frontend.
 
-**Request** — `Authorization: Bearer <Supabase access token>` (§3.1), `Content-Type: application/json`
+#### 4.1a Start — `GET /api/v1/auth/google/start`
 
-```ts
-interface ConnectGmailRequest {
-  providerRefreshToken: string;   // session.provider_refresh_token from the frontend's sign-in
-}
-```
+**Request:** `Authorization: Bearer <Supabase access token>` (§3.1). No body or query.
 
-**Behavior**
+**Behavior:** issue a signed `state`, then build the consent URL with `buildAuthorizationUrl` (scopes from §3.1, `access_type=offline`, `prompt=consent`, `login_hint = claims.email`).
 
-1. Authenticate the bearer (§3.1) → `user_id = claims.sub`, `email = claims.email`.
-2. Validate the body. A missing or empty `providerRefreshToken` → `VALIDATION_FAILED`.
-3. **Prove the refresh token.** Build an `OAuth2Client` with our `GOOGLE_CLIENT_ID`/`SECRET` and the given refresh token, and call `refreshAccessToken()`.
-   - `invalid_grant` (the token is wrong, revoked, or issued to another client) → `GMAIL_TOKEN_REVOKED`.
-4. **Check it belongs to this user.** Call token info on the new access token.
-   - If token info has no `email` or no `sub` (the `email` scope was not granted) → `GMAIL_NOT_CONNECTED` with `details: { missingScopes: ['email'] }`. `sub` becomes `google_id`.
-   - If the token-info `email` is not equal to `claims.email` (case-insensitive) → `VALIDATION_FAILED` with `details: { reason: 'EMAIL_MISMATCH' }`. This stops a user from attaching someone else's mailbox.
-5. **Check scopes.** If any required scope from §3.1 is missing from token info → `GMAIL_NOT_CONNECTED` with `details: { missingScopes }`.
-6. Upsert `users` on conflict `google_id` (linking rules in §5.2) with:
-   - `google_id` (token-info `sub`);
-   - `user_id`;
-   - `email`;
-   - `refresh_token` (the refreshed credentials' `refresh_token` if Google rotated it, else the given one);
-   - `scopes`;
-   - `access_token` and `access_token_expires_at` (from the refreshed credentials' `expiry_date`), written as a pair (§3.1).
-
-   On re-connect, reset `history_id` to `null` (this forces a full sync).
-7. Call `MailProvider.watch()` (§4.5). If it fails, log the failure; it does not fail the request, and `watchExpiration` is `null`.
-8. Run the initial **full sync** (§3.5). If it fails, log the failure; it does not fail the request, and `initialSync` is `'failed'`. `history_id` then stays `null`, so the next push notification runs the full sync instead.
-
-The endpoint is idempotent: calling it again with a valid token for the same user overwrites the row.
+**State format:** `base64url(JSON.stringify({ sub, email, exp, nonce }))` + `.` + `base64url(HMAC-SHA256(JWT_SECRET, payload))`, where:
+- `sub` and `email` come from the bearer's claims;
+- `exp` is now + 10 minutes (epoch seconds);
+- `nonce` is 16 random bytes.
 
 **Response — `200 OK`**
 
 ```ts
-interface ConnectGmailResponse {
-  email: string;
-  scopes: string[];
-  watchExpiration: string | null;   // ISO-8601; null if watch() failed
-  initialSync: 'completed' | 'failed';
+interface StartGmailConnectResponse {
+  authorizationUrl: string;  // https://accounts.google.com/o/oauth2/v2/auth?...&state=...
+  expiresAt: string;         // ISO-8601; when the state stops being accepted
 }
 ```
 
-**Errors**
+**Errors:** `UNAUTHENTICATED` (401), `INTERNAL` (500).
 
-| Code | HTTP | Trigger |
-|---|---|---|
-| `UNAUTHENTICATED` | 401 | Missing or invalid bearer token. |
-| `VALIDATION_FAILED` | 400 | Body not JSON, `providerRefreshToken` missing or empty, `EMAIL_MISMATCH` (step 4), or a linking conflict (`GOOGLE_ACCOUNT_LINKED_ELSEWHERE` or `ANOTHER_GOOGLE_ACCOUNT_LINKED`, §5.2). |
-| `GMAIL_TOKEN_REVOKED` | 401 | Google rejected the refresh token (`invalid_grant`). |
-| `GMAIL_NOT_CONNECTED` | 409 | A required scope (`gmail.modify`, `gmail.send` or `email`) was not granted; `details.missingScopes` lists them. |
-| `GMAIL_RATE_LIMITED` | 429 | Google rate limit during refresh or token info. |
-| `GMAIL_UPSTREAM_ERROR` | 502 | Google 5xx or an unexpected 4xx. |
-| `INTERNAL` | 500 | DB upsert failed or an unexpected exception was thrown. |
+#### 4.1b Callback — `GET /api/v1/auth/google/callback?code&state` (or `?error&state`)
+
+No bearer: the signed `state` identifies the user. Every outcome is a **`302`** to the frontend:
+
+| Outcome | `Location` |
+|---|---|
+| Connected | `{FRONTEND_URL}/settings/gmail?status=connected&initialSync=completed\|failed` |
+| Any error | `{FRONTEND_URL}/settings/gmail?status=error&code=<ErrorCode>[&reason=<details.reason>]` |
+
+**Behavior**
+
+1. **Verify `state`.**
+   - The HMAC is checked in constant time and `exp` must be in the future.
+   - A missing, tampered or expired state → `UNAUTHENTICATED`.
+   - This yields `user_id = sub` and `expectedEmail = email`.
+2. **Handle denial.** If Google sent `error` (e.g. `access_denied`) instead of `code` → `GMAIL_NOT_CONNECTED` with `reason=<Google error>`. A missing `code` → `VALIDATION_FAILED`.
+3. **Exchange the code** with `exchangeAuthorizationCode` (`OAuth2Client.getToken`), then call token info.
+   - `invalid_grant` (expired or reused code) → `GMAIL_TOKEN_REVOKED`.
+   - No refresh token returned → `GMAIL_NOT_CONNECTED`.
+4. **Check identity.** Token info must have `email` and `sub`; otherwise → `GMAIL_NOT_CONNECTED` with `reason=missing_email_scope`. The email must equal `expectedEmail` (case-insensitive); otherwise → `VALIDATION_FAILED` with `reason=EMAIL_MISMATCH`.
+   - This is the CSRF defence: a victim tricked into completing a flow started with an attacker's `state` authorizes the victim's own Google account, whose email doesn't match the attacker's.
+5. **Check scopes.** If `gmail.modify` or `gmail.send` is missing → `GMAIL_NOT_CONNECTED` with `reason=missing_gmail_scope`.
+6. **Upsert** `users` on conflict `google_id` (linking rules in §5.2) with `google_id` (token-info `sub`), `user_id`, `email`, `refresh_token`, `scopes`, and `access_token` / `access_token_expires_at` as a pair (§3.1). Reset `history_id` to `null` on re-connect (this forces a full sync). Linking conflicts → `VALIDATION_FAILED` with `reason=GOOGLE_ACCOUNT_LINKED_ELSEWHERE` or `ANOTHER_GOOGLE_ACCOUNT_LINKED`.
+7. Call `MailProvider.watch()` (§4.5). If it fails, the failure is logged; it doesn't fail the connect.
+8. Run the initial **full sync** (§3.5). If it fails, the failure is logged and `initialSync=failed`. `history_id` then stays `null`, so the next push notification runs the full sync instead.
+
+**Error codes** (in the redirect's `code` parameter): `UNAUTHENTICATED`, `VALIDATION_FAILED`, `GMAIL_TOKEN_REVOKED`, `GMAIL_NOT_CONNECTED`, `GMAIL_RATE_LIMITED`, `GMAIL_UPSTREAM_ERROR`, `INTERNAL`.
+
+If `FRONTEND_URL` itself is not configured, the callback answers `500` with the §3.3 envelope instead of redirecting.
 
 ---
 
@@ -611,10 +612,10 @@ Constraints and indexes:
 | `google_id` | `text` PK | no | Token-info `sub` of the connected Google account (§4.1). This is the upsert conflict target |
 | `user_id` | `uuid` `UNIQUE`, FK → `auth.users(id)` on delete cascade | no | `sub` claim of the verified bearer token (§3.1) |
 | `email` | `text` `UNIQUE` | no | `claims.email` of the bearer token (§4.1) |
-| `refresh_token` | `text`: ciphertext (§5.4) | yes | `providerRefreshToken` from the §4.1 request body (or Google's rotated one); `null` after revocation (§4.5, §4.6) |
+| `refresh_token` | `text`: ciphertext (§5.4) | yes | `refresh_token` from the §4.1b code exchange (or Google's rotated one later); `null` after revocation (§4.5, §4.6) |
 | `scopes` | `text[]` | no | Granted scopes from token info |
-| `access_token` | `text`: ciphertext (§5.4) | yes | §4.1: the `access_token` from its proving refresh. Afterwards: `tokens.access_token` from the `'tokens'` event |
-| `access_token_expires_at` | `timestamptz` | yes | §4.1: that refresh's `expiry_date`. Afterwards: `tokens.expiry_date` (epoch ms) from the `'tokens'` event |
+| `access_token` | `text`: ciphertext (§5.4) | yes | §4.1b: the code exchange's `access_token`. Afterwards: `tokens.access_token` from the `'tokens'` event |
+| `access_token_expires_at` | `timestamptz` | yes | §4.1b: the code exchange's `expiry_date`. Afterwards: `tokens.expiry_date` (epoch ms) from the `'tokens'` event |
 | `history_id` | `text` | yes | Max `historyId` after the last successful sync; `null` forces a full sync |
 | `last_synced_at` | `timestamptz` | yes | Server time |
 | `watch_expiration` | `timestamptz` | yes | `users.watch` response `expiration` (epoch-ms string); `null` means no active watch. Gmail's watch returns no resource ID, so none is stored |

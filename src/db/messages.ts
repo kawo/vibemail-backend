@@ -37,7 +37,17 @@ export interface MessageRow {
   synced_at: string;
 }
 
+/** Keyset position for list pagination: `(internal_date DESC, gmail_id DESC)`. */
+export interface ListCursor {
+  internalDate: string;
+  gmailId: string;
+}
+
 export interface MessagesRepository {
+  /** INBOX rows, newest first, strictly after `after`. Returns at most `limit` rows. */
+  listInbox(userId: string, limit: number, after: ListCursor | null): Promise<MessageRow[]>;
+  /** One stored message, or null. */
+  getMessage(userId: string, gmailId: string): Promise<MessageRow | null>;
   /** Upserts rows on `(user_id, gmail_id)`. Every row must belong to `userId`. */
   upsertMessages(userId: string, rows: MessageRow[]): Promise<void>;
   deleteMessage(userId: string, gmailId: string): Promise<void>;
@@ -53,6 +63,43 @@ export interface MessagesRepository {
 
 export function createMessagesRepository(db: SupabaseClient): MessagesRepository {
   return {
+    async listInbox(userId, limit, after) {
+      let query = db
+        .from('messages')
+        .select('*')
+        .eq('user_id', userId)
+        .contains('label_ids', ['INBOX']);
+      if (after) {
+        // Values are an ISO timestamp and a Gmail ID: neither contains PostgREST filter syntax.
+        query = query.or(
+          `internal_date.lt.${after.internalDate},and(internal_date.eq.${after.internalDate},gmail_id.lt.${after.gmailId})`,
+        );
+      }
+      const { data, error } = await query
+        .order('internal_date', { ascending: false })
+        .order('gmail_id', { ascending: false })
+        .limit(limit)
+        .overrideTypes<MessageRow[], { merge: false }>();
+      if (error) {
+        throw new DatabaseError('messages list', error);
+      }
+      return data ?? [];
+    },
+
+    async getMessage(userId, gmailId) {
+      const { data, error } = await db
+        .from('messages')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('gmail_id', gmailId)
+        .limit(1)
+        .overrideTypes<MessageRow[], { merge: false }>();
+      if (error) {
+        throw new DatabaseError('messages lookup', error);
+      }
+      return data?.[0] ?? null;
+    },
+
     async upsertMessages(userId, rows) {
       if (rows.length === 0) {
         return;

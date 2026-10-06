@@ -15,7 +15,7 @@ const goodGrant: VerifiedGrant = {
   scopes: [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE],
   credentials: { refreshToken: 'r', accessToken: 'a', accessTokenExpiresAt: new Date(Date.now() + 3600_000) },
 };
-const input = { userId: 'user-1', claimsEmail: 'me@example.com', providerRefreshToken: 'r' };
+const input = { userId: 'user-1', expectedEmail: 'me@example.com', code: 'auth-code' };
 
 function setup(grant: VerifiedGrant = goodGrant) {
   const { factory, box } = createFakeProviderFactory(undefined, { grant });
@@ -54,18 +54,19 @@ describe('connectGmailAccount (CONTRACT.md §4.1)', () => {
     expect(log).toHaveBeenCalled();
   });
 
-  it('maps a revoked refresh token to GMAIL_TOKEN_REVOKED without writing', async () => {
+  it('maps a rejected authorization code to GMAIL_TOKEN_REVOKED without writing', async () => {
     const { deps, users } = setup();
-    jest.spyOn(deps.factory, 'verifyRefreshToken').mockRejectedValue(new ProviderError('revoked', 'invalid_grant'));
+    jest.spyOn(deps.factory, 'exchangeAuthorizationCode').mockRejectedValue(new ProviderError('revoked', 'invalid_grant'));
     await expect(connectGmailAccount(deps, input)).rejects.toMatchObject({ code: 'GMAIL_TOKEN_REVOKED' });
     expect(users.rows.size).toBe(0);
   });
 
   it.each([
-    ['no email', { ...goodGrant, email: null }, 'GMAIL_NOT_CONNECTED', { missingScopes: ['email'] }],
-    ['no sub', { ...goodGrant, accountId: null }, 'GMAIL_NOT_CONNECTED', { missingScopes: ['email'] }],
+    ['no refresh token', { ...goodGrant, credentials: { ...goodGrant.credentials, refreshToken: '' } }, 'GMAIL_NOT_CONNECTED', { reason: 'no_refresh_token' }],
+    ['no email', { ...goodGrant, email: null }, 'GMAIL_NOT_CONNECTED', { reason: 'missing_email_scope', missingScopes: ['email'] }],
+    ['no sub', { ...goodGrant, accountId: null }, 'GMAIL_NOT_CONNECTED', { reason: 'missing_email_scope', missingScopes: ['email'] }],
     ['other email', { ...goodGrant, email: 'else@example.com' }, 'VALIDATION_FAILED', { reason: 'EMAIL_MISMATCH' }],
-    ['missing send', { ...goodGrant, scopes: [GMAIL_MODIFY_SCOPE] }, 'GMAIL_NOT_CONNECTED', { missingScopes: [GMAIL_SEND_SCOPE] }],
+    ['missing send', { ...goodGrant, scopes: [GMAIL_MODIFY_SCOPE] }, 'GMAIL_NOT_CONNECTED', { reason: 'missing_gmail_scope', missingScopes: [GMAIL_SEND_SCOPE] }],
   ])('rejects %s without writing', async (_name, grant, code, details) => {
     const { deps, users } = setup(grant);
     await expect(connectGmailAccount(deps, input)).rejects.toMatchObject({ code, details });

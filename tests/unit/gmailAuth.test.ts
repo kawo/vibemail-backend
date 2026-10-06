@@ -11,7 +11,7 @@ import {
   verifyRefreshToken,
   watchInbox,
 } from '../../src/providers/gmail/auth';
-import { compareHistoryIds, createGmailProviderFactory } from '../../src/providers/gmail/provider';
+import { compareHistoryIds } from '../../src/providers/gmail/provider';
 import { ProviderError, type SyncCursor, type TokenUpdate } from '../../src/providers/provider';
 
 const config: GmailAuthConfig = {
@@ -191,10 +191,5 @@ describe('Gmail factory', () => {
     expect(url.searchParams.get('state')).toBe('abc');
     expect(url.searchParams.get('login_hint')).toBe('me@example.com');
     expect(url.searchParams.get('client_id')).toBe('client-id');
-  });
-
-  it('reports methods of later units as not yet built', async () => {
-    const provider = createGmailProviderFactory(config).forAccount(creds, jest.fn());
-    await expect(provider.markRead('x')).rejects.toThrow(/unit 6/);
   });
 });

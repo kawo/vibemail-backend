@@ -39,10 +39,6 @@ export function compareHistoryIds(a: SyncCursor, b: SyncCursor): -1 | 0 | 1 {
   return x < y ? -1 : x > y ? 1 : 0;
 }
 
-function notYetBuilt(method: string, unit: number): never {
-  throw new ProviderError('upstream', `GmailMailProvider.${method} is built in BUILD_SEQUENCE.md unit ${unit}`);
-}
-
 /** Flattens one Gmail history record into ordered changes. Records carry only IDs and label deltas. */
 export function historyToChanges(record: gmail_v1.Schema$History): ProviderChange[] {
   const changes: ProviderChange[] = [];
@@ -173,12 +169,23 @@ export class GmailMailProvider implements MailProvider {
     return { id: data.id, threadId: data.threadId };
   }
 
-  async markRead(_id: string): Promise<{ labels: string[] }> {
-    return notYetBuilt('markRead', 6);
+  /** `messages.modify`; idempotent in Gmail. Returns the message's labels afterwards. */
+  private async modifyLabels(
+    id: string,
+    change: { addLabelIds?: string[]; removeLabelIds?: string[] },
+  ): Promise<{ labels: string[] }> {
+    const { data } = await this.call('messages.modify', () =>
+      this.gmail.users.messages.modify({ userId: 'me', id, requestBody: change }),
+    );
+    return { labels: data.labelIds ?? [] };
   }
 
-  async markUnread(_id: string): Promise<{ labels: string[] }> {
-    return notYetBuilt('markUnread', 6);
+  async markRead(id: string): Promise<{ labels: string[] }> {
+    return this.modifyLabels(id, { removeLabelIds: [GMAIL_UNREAD_LABEL] });
+  }
+
+  async markUnread(id: string): Promise<{ labels: string[] }> {
+    return this.modifyLabels(id, { addLabelIds: [GMAIL_UNREAD_LABEL] });
   }
 
   async watch(): Promise<WatchResult> {

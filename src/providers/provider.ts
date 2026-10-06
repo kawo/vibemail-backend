@@ -190,21 +190,21 @@ export interface MailProviderFactory {
   /** Binds a provider to one mailbox. `onTokens` persists every refresh. */
   forAccount(credentials: AccountCredentials, onTokens: OnTokens): MailProvider;
 
-  /** Proves a refresh token by refreshing once, and reports identity and scopes (CONTRACT.md §4.1). */
+  /**
+   * Proves a refresh token by refreshing once, and reports identity and scopes.
+   * @remarks Not used by v1 routes since connect switched to the code flow (CONTRACT.md §4.1b).
+   */
   verifyRefreshToken(refreshToken: string): Promise<VerifiedGrant>;
 
   /** Orders two cursors issued by this provider: -1 if `a` is older, 0 if equal, 1 if newer. */
   compareCursors(a: SyncCursor, b: SyncCursor): -1 | 0 | 1;
 
-  /**
-   * URL that starts the provider's OAuth consent flow.
-   * @remarks Not used in v1: the frontend signs in through Supabase (CONTRACT.md §3.1).
-   */
+  /** URL that starts the provider's OAuth consent flow (CONTRACT.md §4.1a). */
   buildAuthorizationUrl(options: { state: string; scopes: string[]; loginHint?: string }): string;
 
   /**
-   * Exchanges an authorization code for credentials.
-   * @remarks Not used in v1: the frontend signs in through Supabase (CONTRACT.md §3.1).
+   * Exchanges an authorization code for credentials (CONTRACT.md §4.1b). `credentials.refreshToken`
+   * is empty when the provider issued none.
    */
   exchangeAuthorizationCode(code: string): Promise<VerifiedGrant>;
 }

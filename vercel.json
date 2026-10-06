@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [{ "source": "/webhook/gmail", "destination": "/api/webhook/gmail" }],
+  "functions": {
+    "api/v1/auth/google/callback.ts": { "maxDuration": 60 },
+    "api/webhook/gmail.ts": { "maxDuration": 60 }
+  }
+}

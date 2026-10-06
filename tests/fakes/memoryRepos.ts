@@ -1,4 +1,4 @@
-import type { MessageRow, MessagesRepository } from '../../src/db/messages';
+import type { ListCursor, MessageRow, MessagesRepository } from '../../src/db/messages';
 import type { ConnectedAccount, ConnectedUserInput, UpsertResult, UsersRepository } from '../../src/db/users';
 import type { AccountCredentials, TokenUpdate } from '../../src/providers/provider';
 
@@ -40,6 +40,9 @@ export class MemoryUsers implements UsersRepository {
   async getUserEmail(userId: string): Promise<string | null> {
     return this.rows.get(userId)?.email ?? null;
   }
+  async getLastSyncedAt(userId: string): Promise<Date | null> {
+    return this.rows.get(userId)?.lastSyncedAt ?? null;
+  }
   async getHistoryId(userId: string): Promise<string | null> {
     return this.rows.get(userId)?.historyId ?? null;
   }
@@ -72,6 +75,23 @@ export class MemoryMessages implements MessagesRepository {
     return `${userId}:${gmailId}`;
   }
 
+  async listInbox(userId: string, limit: number, after: ListCursor | null): Promise<MessageRow[]> {
+    const before = (r: MessageRow) =>
+      !after ||
+      r.internal_date < after.internalDate ||
+      (r.internal_date === after.internalDate && r.gmail_id < after.gmailId);
+    return this.forUser(userId)
+      .filter((r) => r.label_ids.includes('INBOX') && before(r))
+      .sort((a, b) =>
+        a.internal_date === b.internal_date
+          ? b.gmail_id.localeCompare(a.gmail_id)
+          : b.internal_date.localeCompare(a.internal_date),
+      )
+      .slice(0, limit);
+  }
+  async getMessage(userId: string, gmailId: string): Promise<MessageRow | null> {
+    return this.rows.get(MemoryMessages.key(userId, gmailId)) ?? null;
+  }
   async upsertMessages(userId: string, rows: MessageRow[]): Promise<void> {
     this.upsertCalls += 1;
     for (const row of rows) {

@@ -1,7 +1,8 @@
 import { timingSafeEqual } from 'crypto';
 import type { MessagesRepository } from '../db/messages';
 import type { UsersRepository } from '../db/users';
-import { type ErrorCode, ApiError } from '../middleware/errors';
+import { errorResponse } from '../http/respond';
+import { ApiError } from '../middleware/errors';
 import { type MailProviderFactory, type SyncCursor, ProviderError } from '../providers/provider';
 import { persistTokensFor } from '../services/gmailAccount';
 import { runIncrementalSync, runInitialSync } from '../sync';
@@ -32,32 +33,6 @@ export interface WebhookDeps {
 const defaultLog = (message: string, error?: unknown): void => {
   console.error(message, error instanceof Error ? error.message : (error ?? ''));
 };
-
-const STATUS: Record<ErrorCode, number> = {
-  UNAUTHENTICATED: 401,
-  GMAIL_NOT_CONNECTED: 409,
-  GMAIL_TOKEN_REVOKED: 401,
-  VALIDATION_FAILED: 400,
-  MESSAGE_NOT_FOUND: 404,
-  GMAIL_RATE_LIMITED: 429,
-  GMAIL_UPSTREAM_ERROR: 502,
-  SYNC_FAILED: 502,
-  INTERNAL: 500,
-};
-
-function errorResponse(error: ApiError): Response {
-  return Response.json(
-    {
-      error: {
-        code: error.code,
-        message: error.message,
-        retryable: false,
-        ...(error.details ? { details: error.details } : {}),
-      },
-    },
-    { status: STATUS[error.code] },
-  );
-}
 
 /** Constant-time comparison of the `?token=` query parameter with the configured token. */
 export function verifyPushToken(provided: string | null, expected: string | undefined): void {

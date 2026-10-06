@@ -149,3 +149,16 @@ describe('GmailMailProvider.sendMessage', () => {
     ).rejects.toMatchObject({ kind: 'not_found' });
   });
 });
+
+describe('GmailMailProvider.markRead / markUnread', () => {
+  it('removes or adds UNREAD with messages.modify and returns the labels', async () => {
+    const { provider, calls } = providerWith((o) => ({
+      data: { id: 'm1', labelIds: o.url.endsWith('/modify') && calls.length === 1 ? ['INBOX'] : ['INBOX', 'UNREAD'] },
+    }));
+    await expect(provider.markRead('m1')).resolves.toEqual({ labels: ['INBOX'] });
+    await expect(provider.markUnread('m1')).resolves.toEqual({ labels: ['INBOX', 'UNREAD'] });
+    const bodies = calls.map((c) => (c as RequestOptions & { data?: unknown }).data);
+    expect(calls[0]?.url).toContain('/gmail/v1/users/me/messages/m1/modify');
+    expect(bodies).toEqual([{ removeLabelIds: ['UNREAD'] }, { addLabelIds: ['UNREAD'] }]);
+  });
+});
