@@ -41,7 +41,7 @@ The project is complete when **every** item below is true and verifiable.
 5. A fixture test maps a recorded Gmail `users.messages.get?format=full` response to a `messages` row that matches §5 field for field. It includes a nested `multipart/alternative` inside `multipart/mixed` and one attachment.
 6. Sync is tested for: first sync (no stored `historyId` → full sync, which stores at most 50 messages even when the inbox holds more), incremental sync (`history.list`), and fallback (`history.list` returns HTTP 404 → full sync). `GET /api/v1/messages` makes zero Gmail API calls (asserted with a fake `MailProvider` that fails on any call).
 7. Mark-as-read is idempotent: calling it twice on the same message returns `200` both times with `isRead: true`.
-8. Replying with `replyToMessageId` sets the `In-Reply-To` and `References` headers, derives the `Re:` subject per §4.3 (ignoring any client `subject`), and sends with the original `threadId` (asserted on the raw MIME and the Gmail request).
+8. Sending with `threadId` passes it unchanged to `messages.send`, and the raw MIME carries the client's subject and no derived threading headers (asserted on the Gmail request). A `threadId` Gmail doesn't know returns `MESSAGE_NOT_FOUND`.
 9. A Google `invalid_grant` on token refresh maps to `GMAIL_TOKEN_REVOKED` on every Gmail-backed endpoint, and clears the stored access token.
    Access-token persistence (§3.1) is tested:
    - a stored token more than 5 minutes from expiry is reused with no refresh call;
@@ -322,47 +322,38 @@ interface ListMessagesResponse {
 
 ### 4.3 Message send — `POST /api/v1/messages/send`
 
-Sends a new message or a reply through Gmail, then stores the sent message.
+Sends a plain-text message through Gmail, optionally into an existing thread, then stores the sent message. Implemented in `src/send/index.ts`.
 
 **Request** — `Content-Type: application/json`
 
 ```ts
 interface SendMessageRequest {
-  to: string[];               // >= 1 address
-  cc?: string[];
-  bcc?: string[];
-  subject?: string;           // required for new messages (may be ""); max 998 chars, no CR/LF.
-                              // ignored when replyToMessageId is set; the server derives it (Behavior §2)
-  text?: string;              // at least one of text / html is required
-  html?: string;
-  replyToMessageId?: string;  // gmailId of a message already stored for this user
+  to: string | string[];  // one address or a list; >= 1, <= 100
+  subject: string;        // may be ""; max 998 chars, no CR/LF
+  body: string;           // plain text (text/plain; charset=UTF-8)
+  threadId?: string;      // a Gmail thread ID in this user's mailbox, passed to Gmail as-is
 }
 ```
 
-Validation rules:
+Validation rules (`VALIDATION_FAILED` with `details.issues` listing every failure):
 
-- Every address is a valid RFC 5322 addr-spec, or `Name <addr-spec>`.
-- Total recipients across `to`, `cc`, and `bcc` is ≤ 100.
-- `subject` is required when `replyToMessageId` is absent.
-- No header field (subject or addresses) may contain CR or LF characters, which prevents header injection.
+- Every address is a valid RFC 5322 addr-spec, or `Name <addr-spec>`, with no CR/LF.
+- `subject` contains no CR or LF (header injection) and is at most 998 characters.
+- `body` is a string. An empty body is allowed.
+- `threadId`, when present, is a non-empty string of letters and digits.
 
 **Behavior**
 
-1. Authenticate, then load `users`.
-2. If `replyToMessageId` is set, load that row (it must belong to the user) and set:
-   - `In-Reply-To: <original rfc822_message_id>`
-   - `References: <original references> <original rfc822_message_id>`
-   - The subject is derived by the server, and any client-supplied `subject` is ignored. Gmail threads a reply only when the `Subject` matches the original.
-     - If the original `subject` already starts with `Re:` (case-insensitive, after trimming), it is reused verbatim.
-     - Otherwise it becomes `Re: <original subject>`.
-     - A null original subject gives `Re:`.
-   - `threadId = original thread_id`
-3. Build an RFC 2822 MIME message:
-   - If both bodies are present: `multipart/alternative` with `text/plain` and `text/html` parts.
-   - Otherwise: a single part.
-   - Encoding: UTF-8, with RFC 2047-encoded subject.
-4. Call `users.messages.send({ userId: 'me', requestBody: { raw: base64url(mime), threadId? } })`.
-5. Call `users.messages.get({ id: sent.id, format: 'full' })` and upsert the row.
+1. Authenticate (§3.1), then load the user's credentials and account email from `users`.
+2. Build an RFC 2822 message (`src/providers/gmail/mime.ts`, behind `MailProvider.sendMessage`):
+   - Headers: `From: <users.email>`, `To`, `Subject`, `Date`, `MIME-Version: 1.0`.
+   - The subject is RFC 2047-encoded when it isn't ASCII.
+   - The body is a single `text/plain; charset=UTF-8` part, base64 content-transfer-encoded.
+   - Lines end in CRLF.
+3. Call `users.messages.send({ userId: 'me', requestBody: { raw: base64url(mime), threadId? } })`.
+   - `threadId` is passed through unchanged. No `In-Reply-To` / `References` headers are derived and the subject is not rewritten.
+   - Gmail itself files the message in that thread, but recipients' mail clients may not thread it unless the subject matches.
+4. `messages.send` returns only `id`, `threadId` and `labelIds`. So call `users.messages.get({ id, format: 'full' })`, normalize it with the same parser as sync (§5.1), and upsert the row on `(user_id, gmail_id)`.
 
 **Response — `201 Created`**
 
@@ -376,11 +367,11 @@ interface SendMessageResponse {
 
 | Code | HTTP | Trigger |
 |---|---|---|
-| `UNAUTHENTICATED` | 401 | No valid session. |
+| `UNAUTHENTICATED` | 401 | Missing or invalid bearer token. |
 | `GMAIL_NOT_CONNECTED` | 409 | No `users` row or refresh token. |
 | `GMAIL_TOKEN_REVOKED` | 401 | `invalid_grant`. |
 | `VALIDATION_FAILED` | 400 | Body is not JSON, or it fails any rule above (`details.issues` lists them). |
-| `MESSAGE_NOT_FOUND` | 404 | `replyToMessageId` is not in this user's `messages` rows. |
+| `MESSAGE_NOT_FOUND` | 404 | Gmail rejected `threadId` as not found in this mailbox (`details: { threadId }`). |
 | `GMAIL_RATE_LIMITED` | 429 | Gmail rate limit. |
 | `GMAIL_UPSTREAM_ERROR` | 502 | Gmail send/get returned 5xx or an unexpected 4xx. |
 | `INTERNAL` | 500 | DB error or an unexpected exception. |

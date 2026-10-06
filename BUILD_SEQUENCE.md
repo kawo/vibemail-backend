@@ -125,17 +125,20 @@
 - The renewal job, given three accounts where one throws `invalid_grant`, renews the other two, clears the third's tokens, and reports `{ renewed: 2, revoked: 1, failed: 0 }`.
 
 ### 5. Send layer
-**What:** `POST /api/v1/messages/send` (CONTRACT.md §4.3):
-- **Validation.** Recipients must be valid addresses, at most 100 in total. CR/LF in any header is rejected to block header injection. At least one of `text`/`html` is required.
-- **MIME builder.** Lives in `src/providers/gmail/`, behind `sendMessage(OutgoingMessage)`. It produces an RFC 2822 message: `From` is the account email from `users.email`, the subject is RFC 2047-encoded, and the body is `multipart/alternative` when both text and HTML are given, a single part otherwise.
-- **Send.** `src/send` builds an `OutgoingMessage` and calls `MailProvider.sendMessage`. The Gmail implementation base64url-encodes the MIME into `raw` and passes `threadId`.
-- **Replies.** Gmail threads a reply only when the request carries the original `threadId`, the `In-Reply-To`/`References` headers follow RFC 2822, and the `Subject` matches. So for a reply the builder sets `In-Reply-To` and `References` from the stored original, derives the subject server-side (CONTRACT.md §4.3: `Re: <original subject>` unless it already starts with `Re:`, ignoring any client `subject`), and passes the original's `thread_id`.
-- **Store.** The sent message is fetched back with `getMessage` and upserted through unit 3's parser, then returned as `201 { message }`.
+**What:** `src/send/index.ts`, behind `POST /api/v1/messages/send` (CONTRACT.md §4.3).
+- **Validation.** It accepts `{ to: string | string[], subject, body, threadId? }`. Recipients must be valid addresses, 1 to 100 of them. CR/LF in any header is rejected to block header injection.
+- **MIME builder.** `src/providers/gmail/mime.ts`, behind `sendMessage(OutgoingMessage)`. It produces an RFC 2822 message:
+  - `From` is the account email from `users.email`;
+  - the subject is RFC 2047-encoded when it isn't ASCII;
+  - the body is a single UTF-8 `text/plain` part;
+  - lines end in CRLF.
+- **Send.** The Gmail implementation base64url-encodes the MIME into `raw` and passes `threadId` through unchanged. No reply headers are derived.
+- **Store.** The sent message is fetched back with `getMessage` (`messages.send` returns only `id`, `threadId`, `labelIds`), normalized by the unit 3 parser, and upserted on `(user_id, gmail_id)`. A failure after a successful send reports `details.sentGmailId`.
 
 **Verified:** A message sends successfully through Gmail for an authenticated user. Concretely:
-- An authenticated `POST` returns `201` with a `MessageDTO` whose `gmailId` exists in Gmail and whose `labelIds` include `SENT`, and the same row is in `messages`.
-- The `raw` sent to Gmail decodes to valid MIME with the expected `From`/`To`/`Subject` and bodies.
-- An unauthenticated request returns `401 UNAUTHENTICATED` and makes no Gmail call.
+- A send for a connected user stores a row whose `gmail_id` is the one Gmail returned, whose `label_ids` include `SENT`, and whose `from_address` and `to_address` match the request.
+- The `raw` sent to Gmail decodes to valid MIME with the expected `From`/`To`/`Subject` and body, and `threadId` reaches Gmail unchanged.
+- An unconnected user gets `GMAIL_NOT_CONNECTED`, and invalid input gets `VALIDATION_FAILED`. Neither makes a Gmail call.
 
 ### 6. Mark-as-read layer
 **What:** The logic behind `POST /api/v1/messages/{id}/read` (CONTRACT.md §4.4):

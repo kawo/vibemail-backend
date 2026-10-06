@@ -37,6 +37,9 @@ export class MemoryUsers implements UsersRepository {
       row.watch = expiresAt;
     }
   }
+  async getUserEmail(userId: string): Promise<string | null> {
+    return this.rows.get(userId)?.email ?? null;
+  }
   async getHistoryId(userId: string): Promise<string | null> {
     return this.rows.get(userId)?.historyId ?? null;
   }

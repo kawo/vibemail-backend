@@ -118,3 +118,34 @@ describe('GmailMailProvider.listChanges', () => {
     await expect(provider.listChanges(cursor('1'))).rejects.toMatchObject({ kind: 'cursor_expired' });
   });
 });
+
+describe('GmailMailProvider.sendMessage', () => {
+  it('sends base64url RFC 2822 with threadId passed through', async () => {
+    const { provider, calls } = providerWith(() => ({ data: { id: 's1', threadId: 'T9', labelIds: ['SENT'] } }));
+    const result = await provider.sendMessage({
+      from: 'me@example.com',
+      to: ['you@example.com'],
+      subject: 'Hi',
+      text: 'Hello',
+      threadId: 'T9',
+    });
+    expect(result).toEqual({ id: 's1', threadId: 'T9' });
+    const call = calls[0] as RequestOptions & { data?: { raw: string; threadId?: string } };
+    expect(call.url).toContain('/gmail/v1/users/me/messages/send');
+    expect(call.data?.threadId).toBe('T9');
+    const mime = Buffer.from(call.data?.raw ?? '', 'base64url').toString('utf8');
+    expect(mime).toContain('From: me@example.com\r\n');
+    expect(mime).toContain('To: you@example.com\r\n');
+    expect(mime).toContain('Subject: Hi\r\n');
+    expect(mime).not.toContain('In-Reply-To');
+  });
+
+  it('maps a 404 to not_found', async () => {
+    const { provider } = providerWith(() => {
+      throw { response: { status: 404 } };
+    });
+    await expect(
+      provider.sendMessage({ from: 'a@x.io', to: ['b@x.io'], subject: 's', text: 't', threadId: 'nope' }),
+    ).rejects.toMatchObject({ kind: 'not_found' });
+  });
+});

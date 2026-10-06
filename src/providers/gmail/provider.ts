@@ -26,6 +26,7 @@ import {
 } from './auth';
 import { google, type gmail_v1 } from 'googleapis';
 import { parseGmailMessage } from './messages';
+import { buildRfc2822, toRaw } from './mime';
 
 export const GMAIL_INBOX_LABEL = 'INBOX';
 export const GMAIL_UNREAD_LABEL = 'UNREAD';
@@ -155,8 +156,21 @@ export class GmailMailProvider implements MailProvider {
     };
   }
 
-  async sendMessage(_message: OutgoingMessage): Promise<{ id: string; threadId: string }> {
-    return notYetBuilt('sendMessage', 5);
+  /** Builds RFC 2822 MIME and sends it; `threadId` is passed to Gmail unchanged (CONTRACT.md §4.3). */
+  async sendMessage(message: OutgoingMessage): Promise<{ id: string; threadId: string }> {
+    const { data } = await this.call('messages.send', () =>
+      this.gmail.users.messages.send({
+        userId: 'me',
+        requestBody: {
+          raw: toRaw(buildRfc2822(message)),
+          ...(message.threadId ? { threadId: message.threadId } : {}),
+        },
+      }),
+    );
+    if (!data.id || !data.threadId) {
+      throw new ProviderError('upstream', 'messages.send response lacks id or threadId');
+    }
+    return { id: data.id, threadId: data.threadId };
   }
 
   async markRead(_id: string): Promise<{ labels: string[] }> {

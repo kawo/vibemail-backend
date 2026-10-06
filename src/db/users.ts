@@ -45,6 +45,8 @@ export interface UsersRepository {
   /** Decrypted credentials, or null when the user has no row or no refresh token. */
   getUserCredentials(userId: string): Promise<AccountCredentials | null>;
   updateWatch(userId: string, expiresAt: Date): Promise<void>;
+  /** The connected mailbox address (`users.email`), or null when the user has no row. */
+  getUserEmail(userId: string): Promise<string | null>;
   /** The stored sync position (`history_id`), or null when a full sync is needed. */
   getHistoryId(userId: string): Promise<string | null>;
   /** Records a completed sync: sets `history_id` and `last_synced_at`. Callers enforce advance-only. */
@@ -185,6 +187,18 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
       if (error) {
         throw new DatabaseError('users watch update', error);
       }
+    },
+
+    async getUserEmail(userId) {
+      const { data, error } = await table()
+        .select('email')
+        .eq('user_id', userId)
+        .maybeSingle()
+        .overrideTypes<{ email: string } | null, { merge: false }>();
+      if (error) {
+        throw new DatabaseError('users email lookup', error);
+      }
+      return data?.email ?? null;
     },
 
     async getHistoryId(userId) {
