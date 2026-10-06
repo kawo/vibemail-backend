@@ -95,4 +95,4 @@ With the Supabase GitHub integration, merging into `main` runs the migration on 
 - **History records carry only IDs:** label changes are deltas, applied to stored `label_ids`; an unknown message is fetched and stored; a 404 on `get` is skipped (CONTRACT.md §3.5).
 - **Sync state:** sync starts from the **stored** `history_id`, never from a notification's `historyId`. That value only advances, under a per-user advisory lock. A `history.list` 404 falls back to a full sync of the 50 newest messages.
 - **Webhook responses:** the webhook verifies the token and decodes the body, then returns `200` at once and runs the sync inside `waitUntil` (`@vercel/functions`). Background failures are logged, not retried. Never move sync work before the ack.
-- **Replies:** the server derives the reply subject (`Re: <original>`), because Gmail threads only when the subject, `threadId`, `In-Reply-To` and `References` all match.
+- **Send:** the input is `{ to, subject, body, threadId? }`. `threadId` is passed to Gmail unchanged; no reply headers are derived. The sent message is fetched back with `messages.get`, because `messages.send` returns only `id`, `threadId` and `labelIds`.
