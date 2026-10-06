@@ -46,7 +46,7 @@ List every file from both. Then compare each one against the expected scope for 
 
 | Unit | Expected scope (besides the always-in-scope files) |
 |---|---|
-| 1. Provider abstraction interface | `src/providers/` (the interface only, no implementation) |
+| 1. Provider abstraction interface | `src/providers/provider.ts` (no implementation), `jest.config.js`, `tsconfig.check.json` |
 | 2. Gmail OAuth layer + token persistence | `src/middleware/`, `src/providers/gmail/`, `src/db/`, `api/v1/auth/google/callback.ts`, `package.json`, `package-lock.json` |
 | 3. Sync and read layer | `src/sync/`, `src/db/`, `src/providers/gmail/` |
 | 4. Pub/Sub webhook receiver + cron renewal | `src/webhook/`, `src/cron/`, `src/sync/`, `src/db/`, `src/providers/gmail/` |

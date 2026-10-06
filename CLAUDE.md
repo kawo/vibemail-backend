@@ -24,14 +24,15 @@ Any change to an endpoint, an `ErrorCode` or a stored field goes into `CONTRACT.
 - **Tests:** Jest via `ts-jest`, plus `supertest`. `supertest` needs a small adapter, because the handlers take a Web `Request` rather than a Node `http.Server`.
 - **Deployment:** Vercel Functions under top-level `api/`, with no framework. Each file exports `GET`/`POST(request: Request): Promise<Response>` on the Node.js runtime (never Edge). `vercel.json` holds the cron job, the per-function `maxDuration`, and the `/webhook/gmail` rewrite.
 - **Two tsconfigs.** `tsconfig.json` keeps `rootDir: ./src` while also including `api/`, so plain `tsc` fails with TS6059. Never run bare `tsc`; Vercel compiles `api/` itself.
-  - **Type-checking:** always via `tsconfig.check.json`, which extends the base config with `rootDir: "."`, `noEmit` and `tests/`.
-  - **Jest:** when the Jest config is created, point ts-jest at that file: `transform: { '^.+\.ts$': ['ts-jest', { tsconfig: 'tsconfig.check.json' }] }`.
+  - **Type-checking:** always via `tsconfig.check.json`, which extends the base config with `rootDir: "."`, `noEmit`, `tests/`, and `types: ["node", "jest"]`. TypeScript 6 no longer loads `@types/*` packages automatically.
+  - **Target is ES2020:** there is no `Error.cause` or other ES2022 library API. Declare such fields explicitly (see `ProviderError`).
+  - **Jest:** `jest.config.js` (CommonJS; a `.ts` config fails to load as an ES module) points ts-jest at `tsconfig.check.json`.
 - **Blocked install scripts:** npm blocked them for `esbuild`, `unrs-resolver` and `@parcel/watcher`. If `vercel dev` or Jest resolution fails, check `npm install-scripts ls`.
 
 ## Commands
 
 ```bash
-npm test                            # jest --ci --runInBand (needs a jest.config pointing ts-jest at tsconfig.check.json)
+npm test                            # jest --ci --runInBand
 npx jest tests/unit/foo.test.ts     # single file
 npx jest -t "name of test"          # single test by name
 npm run typecheck                   # tsc -p tsconfig.check.json (src/, api/, tests/); `npm run build` runs the same
