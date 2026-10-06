@@ -52,7 +52,7 @@ List every file from both. Then compare each one against the expected scope for 
 | 4. Pub/Sub webhook receiver + cron renewal | `src/webhook/`, `src/cron/`, `src/sync/`, `src/db/`, `src/providers/gmail/` |
 | 5. Send layer | `src/send/`, `src/db/`, `src/providers/gmail/` |
 | 6. Mark-as-read layer | `src/db/`, `src/providers/gmail/`, plus one new module for the mark-read logic under `src/` (report its path) |
-| 7. Vercel API function entry points | `api/**`, `src/middleware/`, `vercel.json` |
+| 7. Vercel API function entry points | `api/**`, `src/middleware/`, `src/http/`, `vercel.json` |
 | 8. Integration tests | `tests/**`, test configuration (`jest.config.*`, `tests/` fixtures), `package.json` |
 
 A file outside the table's scope is an **unexpected modification**, even if the change looks harmless. `jest-results.json` is git-ignored and never counts.

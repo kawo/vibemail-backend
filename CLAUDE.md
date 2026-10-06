@@ -82,7 +82,7 @@ With the Supabase GitHub integration, merging into `main` runs the migration on 
 - **Errors:** every error response uses the CONTRACT.md §3.3 envelope `{ error: { code, message, retryable, details? } }`, with the closed `ErrorCode` union. Do not add codes without updating §3.3.
 - **Pagination:** every list endpoint uses cursor-based pagination. The cursor is opaque base64url keyset `(internal_date DESC, gmail_id DESC)`, and responses return `nextCursor`. No offsets.
 - **Paths:** every client endpoint lives under `/api/v1`.
-- **Auth:** JWT Bearer auth on every `/api/v1` endpoint, *including* the OAuth callback (`POST /api/v1/auth/google/callback`). The callback needs the bearer to know which user the Gmail tokens belong to.
+- **Auth:** JWT Bearer auth on every `/api/v1` endpoint except `GET /api/v1/auth/google/callback`. That one is Google's browser redirect, authenticated by the HMAC-signed `state` issued by the bearer-protected `GET /api/v1/auth/google/start` (CONTRACT.md §4.1). The backend runs Google's code flow itself.
   - Tokens are verified with `jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'], audience: 'authenticated', issuer: SUPABASE_URL + '/auth/v1' })`. The algorithm allow-list is mandatory.
   - `userId` comes only from the token's `sub`.
 - **Machine endpoints** are outside `/api/v1` and don't use the user JWT:
