@@ -32,7 +32,7 @@
 - **Bearer auth.** `requireUser(request)` in `src/middleware` verifies `Authorization: Bearer <Supabase access token>` with `jsonwebtoken` against `JWT_SECRET` (HS256 only, `aud: 'authenticated'`, issuer checked) and yields `userId` and `email` (CONTRACT.md §3.1). There are no cookies and no anon key.
 - **Connect Gmail.** `POST /api/v1/auth/google/callback` (CONTRACT.md §4.1). The frontend has already run Supabase's Google sign-in with `access_type: 'offline'` and `prompt: 'consent'`, and posts the `providerRefreshToken` it received. The backend then:
   1. proves the token with one `refreshAccessToken()`;
-  2. checks with token info that the Google account's email equals the bearer's email and that both Gmail scopes were granted;
+  2. checks with token info that `gmail.modify`, `gmail.send` and `email` were granted, and that the Google account's email equals the bearer's email;
   3. upserts `gmail_accounts` with the refresh token, access token, expiry and scopes;
   4. calls `watch()`, then runs the initial full sync from unit 3. That sync is wired in once unit 3 exists; until then the step is a no-op.
 - **Client factory.** Builds a per-user `googleapis` `OAuth2Client` and seeds it with the stored `refresh_token`, `access_token` and `expiry_date`. The library reuses the access token until it is within 5 minutes of expiry (`eagerRefreshThresholdMillis`, default 300 000 ms), then refreshes.
@@ -49,7 +49,7 @@
   - with `401 UNAUTHENTICATED` when there is no bearer;
   - with `401 GMAIL_TOKEN_REVOKED` when the refresh token is bad;
   - with `400 VALIDATION_FAILED` (`EMAIL_MISMATCH`) when the Google account's email differs from the bearer's;
-  - with `409 GMAIL_NOT_CONNECTED` when a Gmail scope is missing.
+  - with `409 GMAIL_NOT_CONNECTED` when a Gmail scope is missing, and also when token info has no `email` because the `email` scope wasn't granted (`details.missingScopes` names it).
 
   In each rejected case, no row is written.
 - With a stored access token more than 5 minutes from expiry, a Gmail call reuses it and makes no token-endpoint request.
@@ -71,7 +71,9 @@
 - **Incremental sync.** A second sync calls `history.list` with `startHistoryId` equal to the stored `last_history_id`. It then applies exactly the recorded changes and nothing else:
   - one added message is fetched and inserted;
   - one deleted message's row is removed;
-  - a removed `UNREAD` label flips `is_read` to `true`.
+  - a removed `UNREAD` label flips `is_read` to `true`;
+  - a `messagesAdded` entry whose `get` returns 404 is skipped without failing the sync;
+  - an `INBOX` label added to a message that isn't stored causes one `get` and an insert with its full label set.
 
   It makes no `messages.list` call, and `last_history_id` advances to the response's `historyId`.
 - **404 fallback.** When `history.list` returns 404, the sync falls back to a full sync (the 50 newest), and `last_history_id` is reset from the newest message.

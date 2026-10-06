@@ -86,8 +86,9 @@ The project is complete when **every** item below is true and verifiable.
     - `refresh_token` is written only when Google returns a new one.
   - **Paired columns.** `access_token` and `access_token_expires_at` are always written together, or both set to `null`. `google-auth-library` treats a credential with no `expiry_date` as *never expiring*, so an access token stored without an expiry would never be refreshed. A DB `CHECK` enforces the pairing (§5.2).
   - **Revocation.** On `invalid_grant`, both access-token columns are set to `null`.
-- Required Google scopes: `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/gmail.send`. The frontend starts sign-in with `signInWithOAuth({ provider: 'google', options: { scopes, queryParams: { access_type: 'offline', prompt: 'consent' } } })` so that Google returns a refresh token.
-- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` configure every `OAuth2Client`. `GOOGLE_REDIRECT_URI` must be registered on that Google OAuth client. The backend never performs an authorization-code exchange in v1, so the value is client configuration only.
+- Required Google scopes: `https://www.googleapis.com/auth/gmail.modify`, `https://www.googleapis.com/auth/gmail.send` and `email`. Google's token info returns the account's `email` only when the `email` scope was granted, and §4.1 needs it. Supabase's Google provider normally requests `email`, but it must be present. The frontend starts sign-in with `signInWithOAuth({ provider: 'google', options: { scopes, queryParams: { access_type: 'offline', prompt: 'consent' } } })` so that Google returns a refresh token.
+- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` configure every `OAuth2Client`. The client is always constructed with the options object, `new OAuth2Client({ clientId, clientSecret, redirectUri })`, because the positional-argument form is deprecated in `google-auth-library` 11.
+- **Revocation detection.** A refresh rejected for a revoked or invalid refresh token surfaces as a `GaxiosError` with `response.data.error === 'invalid_grant'`. That check is the only trigger for `GMAIL_TOKEN_REVOKED`. `GOOGLE_REDIRECT_URI` must be registered on that Google OAuth client. The backend never performs an authorization-code exchange in v1, so the value is client configuration only.
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` must be the **same** OAuth client configured in the Supabase Google provider. Google only honours a refresh token for the client it was issued to.
 
 ### 3.2 Format
@@ -183,9 +184,14 @@ The procedure is shared by the connect endpoint (§4.1) and the webhook (§4.5);
 
 - **Full sync** (when `last_history_id` is `null`, or on the 404 fallback): `users.messages.list({ labelIds: ['INBOX'], maxResults: 50 })`, a single page with no further paging, so at most the 50 most recent INBOX messages. Then `users.messages.get({ format: 'full' })` each one, upsert it, and set `last_history_id` from the newest message.
 - **Incremental sync** (otherwise): `users.history.list({ startHistoryId: last_history_id, historyTypes: ['messageAdded','messageDeleted','labelAdded','labelRemoved'] })`, paging until done.
+  - History records carry only message `id`s (and `threadId`), so every change is applied as follows:
   - `messagesAdded` → `get` + upsert.
-  - `messagesDeleted` → delete the row.
-  - `labelsAdded` / `labelsRemoved` → update `label_ids` and `is_read`.
+    - If `get` returns **404** (the message was deleted before the sync reached it), skip it and delete any stored row for that `gmail_id`. This is not an error.
+  - `messagesDeleted` → delete the row (a no-op if there is none).
+  - `labelsAdded` / `labelsRemoved` carry only the label IDs that changed, not the message's full label set:
+    - **If the row exists:** apply the change to the stored `label_ids` (set union for added, set difference for removed), then recompute `is_read`.
+    - **If the row does not exist** (e.g. an older message beyond the initial 50 was moved into `INBOX`): `get` the message and upsert it, so its full, current label set is stored. A 404 there is skipped as above.
+  - Records are applied in the order returned, so a later record wins.
   - Afterwards, set `last_history_id` to the response's `historyId`.
 - **404 fallback.** If `history.list` returns **404** (the start ID is outside the retained history window), fall back to a full sync.
 - Both kinds set `gmail_accounts.last_synced_at = now()`.
@@ -228,8 +234,10 @@ interface ConnectGmailRequest {
 2. Validate the body. A missing or empty `providerRefreshToken` → `VALIDATION_FAILED`.
 3. **Prove the refresh token.** Build an `OAuth2Client` with our `GOOGLE_CLIENT_ID`/`SECRET` and the given refresh token, and call `refreshAccessToken()`.
    - `invalid_grant` (the token is wrong, revoked, or issued to another client) → `GMAIL_TOKEN_REVOKED`.
-4. **Check it belongs to this user.** Call token info on the new access token. If the token-info `email` is not equal to `claims.email` (case-insensitive), → `VALIDATION_FAILED` with `details: { reason: 'EMAIL_MISMATCH' }`. This stops a user from attaching someone else's mailbox.
-5. **Check scopes.** If either required scope from §3.1 is missing from token info → `GMAIL_NOT_CONNECTED`.
+4. **Check it belongs to this user.** Call token info on the new access token.
+   - If token info has no `email` (the `email` scope was not granted) → `GMAIL_NOT_CONNECTED` with `details: { missingScopes: ['email'] }`.
+   - If the token-info `email` is not equal to `claims.email` (case-insensitive) → `VALIDATION_FAILED` with `details: { reason: 'EMAIL_MISMATCH' }`. This stops a user from attaching someone else's mailbox.
+5. **Check scopes.** If any required scope from §3.1 is missing from token info → `GMAIL_NOT_CONNECTED` with `details: { missingScopes }`.
 6. Upsert `gmail_accounts` with:
    - `user_id`;
    - `email`;
@@ -261,7 +269,7 @@ interface ConnectGmailResponse {
 | `UNAUTHENTICATED` | 401 | Missing or invalid bearer token. |
 | `VALIDATION_FAILED` | 400 | Body not JSON, `providerRefreshToken` missing or empty, or `EMAIL_MISMATCH` (step 4). |
 | `GMAIL_TOKEN_REVOKED` | 401 | Google rejected the refresh token (`invalid_grant`). |
-| `GMAIL_NOT_CONNECTED` | 409 | A required Gmail scope was not granted. |
+| `GMAIL_NOT_CONNECTED` | 409 | A required scope (`gmail.modify`, `gmail.send` or `email`) was not granted; `details.missingScopes` lists them. |
 | `GMAIL_RATE_LIMITED` | 429 | Google rate limit during refresh or token info. |
 | `GMAIL_UPSTREAM_ERROR` | 502 | Google 5xx or an unexpected 4xx. |
 | `INTERNAL` | 500 | DB upsert failed or an unexpected exception was thrown. |

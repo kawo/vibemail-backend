@@ -15,7 +15,10 @@ Any change to an endpoint, an `ErrorCode` or a stored field goes into `CONTRACT.
 ## Stack
 
 - **Runtime and language:** Node.js and TypeScript in strict mode. TypeScript is **pinned to 6.x**, because `ts-jest` does not support 7.
-- **Gmail:** `googleapis`.
+- **Gmail:** `googleapis` (183.x) with `google-auth-library` 11.x.
+  - Construct clients only as `new OAuth2Client({ clientId, clientSecret, redirectUri })`; the positional form is deprecated.
+  - Detect revocation by `GaxiosError` with `response.data.error === 'invalid_grant'`.
+  - `users.watch` uses `labelFilterBehavior: 'INCLUDE'`; `labelFilterAction` is deprecated and ignored when the newer field is set.
 - **Database:** the Supabase JS client, using a single service-role client. There is no anon key.
 - **Auth tokens:** `jsonwebtoken` verifies Supabase access tokens.
 - **Tests:** Jest via `ts-jest`, plus `supertest`. `supertest` needs a small adapter, because the handlers take a Web `Request` rather than a Node `http.Server`.
@@ -87,6 +90,7 @@ With the Supabase GitHub integration, merging into `main` runs the migration on 
 - **Tenant isolation:** the service-role client bypasses RLS, so every user-scoped query lives in `src/db/` and filters on `user_id`.
   - Only `findAccountByEmailUnscoped` (webhook) and `listConnectedAccountsUnscoped` (cron) may skip that filter.
   - RLS is enabled with no policies, which closes the public Data API.
+- **History records carry only IDs:** label changes are deltas, applied to stored `label_ids`; an unknown message is fetched and stored; a 404 on `get` is skipped (CONTRACT.md §3.5).
 - **Sync state:** sync starts from the **stored** `last_history_id`, never from a notification's `historyId`. That value only advances, under a per-user advisory lock. A `history.list` 404 falls back to a full sync of the 50 newest messages.
 - **Webhook responses:** the webhook returns non-2xx only when a retry could help, because Pub/Sub redelivers on any non-2xx.
 - **Replies:** the server derives the reply subject (`Re: <original>`), because Gmail threads only when the subject, `threadId`, `In-Reply-To` and `References` all match.
