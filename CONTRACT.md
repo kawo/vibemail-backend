@@ -36,7 +36,7 @@ The project is complete when **every** item below is true and verifiable.
 
 1. All six routes exist at the exact paths in §4 and accept/return exactly the shapes defined there.
 2. Every `ErrorCode` listed in an endpoint's error table has at least one Jest test that triggers it and asserts the HTTP status and the error envelope from §3.3.
-3. `jest --ci --runInBand` passes (TypeScript via `ts-jest`, TypeScript pinned to 6.x because `ts-jest` does not support 7), including integration tests running against local Supabase (`supabase start`) with the `schema` branch's migration applied, in the §6 Gate 1 worktree.
+3. `jest --ci --runInBand` passes (TypeScript via `ts-jest`, TypeScript pinned to 6.x because `ts-jest` does not support 7), including the integration tests in `tests/integration/`. They run against the **dev/test Supabase project** configured in `.env` (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`), with the `schema` branch's migration applied there, in the §6 Gate 1 worktree. They never run against production.
 4. `npm run typecheck` (`tsc -p tsconfig.check.json`, covering `src/`, `api/` and `tests/`) passes with `strict: true`, and lint passes with zero errors.
 5. A fixture test maps a recorded Gmail `users.messages.get?format=full` response to a `messages` row that matches §5 field for field. It includes a nested `multipart/alternative` inside `multipart/mixed` and one attachment.
 6. Sync is tested for: first sync (no stored `historyId` → full sync, which stores at most 50 messages even when the inbox holds more), incremental sync (`history.list`), and fallback (`history.list` returns HTTP 404 → full sync). `GET /api/v1/messages` makes zero Gmail API calls (asserted with a fake `MailProvider` that fails on any call).
@@ -671,7 +671,7 @@ OAuth tokens are encrypted in application code before they reach the database. T
 
 ### Order
 
-1. **Schema session (draft).** On `schema`, write `supabase/migrations/<timestamp>_vibemail.sql` and `src/types/` implementing §5 and §3.4 exactly. Commit and push `schema`, but do **not** merge it or review it. Do not apply it to any remote Supabase project.
+1. **Schema session (draft).** On `schema`, write `supabase/migrations/<timestamp>_vibemail.sql` and `src/types/` implementing §5 and §3.4 exactly. Commit and push `schema`, but do **not** merge it or review it. It may be applied to the dev/test project in `.env`, which the integration tests need. It must not be applied to the production project.
 2. **Server session.** On `main`, build every unit of BUILD_SEQUENCE.md. Code imports types from `src/types/`. Because those files live only on `schema` until the merge, `main` on its own is not expected to typecheck. All verification runs on the integration check below.
 3. **Gate 1, the integration check.** In a throwaway worktree, merge `schema` into `main` without pushing:
 
@@ -679,7 +679,7 @@ OAuth tokens are encrypted in application code before they reach the database. T
    git worktree add ../vibemail-gate main
    cd ../vibemail-gate
    git merge --no-ff --no-edit schema
-   supabase db reset
+   # the dev/test project in .env must already have schema's migration applied
    npm test
    npm run typecheck
    npm run lint
@@ -690,7 +690,7 @@ OAuth tokens are encrypted in application code before they reach the database. T
 
 ### Forbidden
 
-- Merging `schema` (or applying its migration to a remote project) before Gate 1 has passed on the current tips of both branches.
+- Merging `schema` (or applying its migration to the production project) before Gate 1 has passed on the current tips of both branches.
 - Writing to `src/db/` (or anything else outside its ownership column) from the schema session, and writing to `supabase/migrations/` or `src/types/` from the server session.
 - Changing endpoint contracts (§4) from the schema session. A required change goes back to the server session.
 

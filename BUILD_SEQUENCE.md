@@ -197,26 +197,25 @@ Vercel details for these files:
 - A real Google-signed delivery is out of scope for this unit; it is checked on a Vercel preview deployment.
 
 ### 8. Integration tests
-**What:** The Jest integration suite (`ts-jest`, `tests/integration/`) that proves CONTRACT.md §2 end to end. It runs against a **running local Supabase stack** (real Postgres, Auth and PostgREST), not a mocked database client.
-- **Database.** The suite runs in the Gate 1 worktree (`main` merged with `schema`, CONTRACT.md §6). The stack is started with `supabase start` and reset with `supabase db reset` before the run, which applies the schema branch's migration from `supabase/migrations/`. Local URL and keys come from `supabase status`.
-- **Gmail.** Gmail is replaced by a fake `MailProvider` (unit 1) loaded with recorded `format=full`, `history.list`, `send` and `watch` fixtures. No Google account or network is needed.
-- **Coverage.** The suite includes:
-  - every endpoint's success path and every `ErrorCode` in its error table (§2, criterion 2);
-  - the sync, fallback and 50-message cap cases;
-  - webhook delta and duplicate handling;
-  - cron auth (`401` without the bearer, fail closed without `CRON_SECRET`) and per-account failure isolation;
-  - mark-read idempotence;
-  - reply threading;
-  - `invalid_grant` → `GMAIL_TOKEN_REVOKED`;
-  - an isolation test using two real local Auth users, proving that user A cannot read or modify user B's rows through any endpoint;
-  - a check that RLS is enabled with no policies, so a direct Data API call with a user token returns no rows;
-  - rejection of a token signed with the wrong secret, of one with `alg: none`, and of one with the wrong audience.
-- **Hosted projects.** No hosted Supabase project is touched, in line with CONTRACT.md §6. If the Supabase GitHub integration is enabled, `schema` must not be merged into `main` before Gate 1, because merging runs the migration against production.
+**What:** The Jest integration suite (`ts-jest`, `tests/integration/`) that proves CONTRACT.md §2 end to end. It runs against the **live dev/test Supabase project in `.env`** (real Postgres, Auth and PostgREST), not a mocked database client.
+- **Database.**
+  - The suite runs in the Gate 1 worktree (`main` merged with `schema`, CONTRACT.md §6), with the schema branch's migration already applied to the dev/test project.
+  - `tests/integration/support.ts` reads `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` from `.env`. If either is missing, the run fails; it never skips.
+  - Each test creates real Supabase Auth users (`@vibemail.test`) and deletes them in `afterAll`, and their rows cascade away with them.
+- **Gmail.** Gmail is replaced by the fake `MailProvider` (unit 1). No Google account or network is needed.
+- **Auth.** Bearer tokens are signed with a test secret. The server verifies them locally (CONTRACT.md §3.1), so the project's real JWT secret is not needed.
+- **Failures.** `INTERNAL` is produced by a real database failure, using a client with an invalid key, not by a mock.
+- **Files.**
+  - `endpoints.test.ts`: every §4 endpoint, every status code, and every `error.code` in its error table, plus cross-user isolation.
+  - `webhook.test.ts`: acknowledge-first, and the delta fetched from the stored `history_id`.
+  - `oauthPersistence.test.ts`: token encryption at rest, the pairing CHECK, and the token persistence listener.
+  - Message normalisation is a unit test: `tests/unit/normalisation.test.ts`.
 
-**Verified:** The full suite passes with no skipped tests against live Supabase, where "live" means the running local stack. Concretely:
-- After `supabase db reset`, `jest --ci --runInBand --json --outputFile=jest-results.json` exits 0. `--runInBand` is used because all tests share one local database.
+**Verified:** The full suite passes with no skipped tests against the live dev/test Supabase project. Concretely:
+- `jest --ci --runInBand --json --outputFile=jest-results.json` exits 0. `--runInBand` is used because all tests share one database.
 - In the JSON report, `numFailedTests`, `numPendingTests` and `numTodoTests` are all `0`, and `numPassedTests === numTotalTests`.
 - Jest has no option to fail on `.only`. Instead, a leftover `.only` shows up because Jest reports every test it skipped as pending, so `numPendingTests` is no longer `0`. The lint gate also bans it with `eslint-plugin-jest`'s `jest/no-focused-tests`, set to `error`.
+- After the run, no `@vibemail.test` auth users remain in the project.
 
 ---
 
