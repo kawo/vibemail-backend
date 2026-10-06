@@ -193,7 +193,7 @@ The procedure is shared by the connect endpoint (§4.1) and the webhook (§4.5);
     - **If the row does not exist** (e.g. an older message beyond the initial 50 was moved into `INBOX`): `get` the message and upsert it, so its full, current label set is stored. A 404 there is skipped as above.
   - Records are applied in the order returned, so a later record wins.
   - Afterwards, set `last_history_id` to the response's `historyId`.
-- **404 fallback.** If `history.list` returns **404** (the start ID is outside the retained history window), fall back to a full sync.
+- **404 fallback.** If `history.list` returns **404** (the start ID is outside the retained history window), fall back to a full sync. Through the provider abstraction this surfaces as `ProviderError` with `kind: 'cursor_expired'` (`src/providers/provider.ts`).
 - Both kinds set `gmail_accounts.last_synced_at = now()`.
 
 ### 3.6 Environment variables

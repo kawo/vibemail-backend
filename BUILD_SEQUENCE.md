@@ -14,18 +14,41 @@
 ## Units
 
 ### 1. Provider abstraction interface
-**What:** A TypeScript interface, `MailProvider`, through which all server logic talks to the mail provider. It only declares methods and contains no implementation. It covers the six Gmail operations in CONTRACT.md §4:
+**What:** `src/providers/provider.ts`, a provider-agnostic contract that every email backend implements. No provider SDK type appears in it, so sync, send, webhook and API code never see Gmail types.
 
-| Method | Gmail call it maps to | Used by |
+**Shared types:**
+- **`SyncCursor`:** an opaque branded string; Gmail stores its `historyId` here.
+- **`ProviderError`:** the only error a provider rejects with. Its `kind` is one of `revoked`, `rate_limited`, `not_found`, `cursor_expired` or `upstream`, with an optional `retryAfterSeconds` and `cause`.
+- **Messages:** a normalized `ProviderMessage` (every CONTRACT.md §5.1 source field) and a structured `OutgoingMessage`. Each implementation builds its own wire format.
+- **Changes:** `ProviderChange` with label deltas, `ChangePage`, `WatchResult`.
+- **Credentials:** `AccountCredentials`, `TokenUpdate`, `OnTokens`, `VerifiedGrant`.
+
+**`MailProvider`** (one mailbox, created by `MailProviderFactory.forAccount(credentials, onTokens)`):
+
+| Method | Gmail mapping (unit 2+) | Used by |
 |---|---|---|
-| `listInboxMessageIds(max)` | `users.messages.list` (`labelIds: ['INBOX']`) | Full sync (§4.2) |
-| `getMessage(id)` | `users.messages.get` (`format: 'full'`) | Sync, send (§4.2, §4.3) |
-| `listHistory(startHistoryId, pageToken?)` | `users.history.list` → `history[]` (`messagesAdded`, `messagesDeleted`, `labelsAdded`, `labelsRemoved`), `nextPageToken`, `historyId` | Incremental sync (§4.2) |
-| `sendMessage(raw, threadId?)` | `users.messages.send` (`raw` base64url) | Send (§4.3) |
+| `listInboxMessageIds(max)` | `users.messages.list` (`labelIds: ['INBOX']`) | Full sync (§3.5) |
+| `getMessage(id)` → `ProviderMessage` | `users.messages.get` (`format: 'full'`) + MIME parsing | Sync, send |
+| `listChanges(since, pageToken?)` → `ChangePage` | `users.history.list`; 404 → `ProviderError('cursor_expired')` | Incremental sync (§3.5) |
+| `sendMessage(OutgoingMessage)` | MIME build + `users.messages.send` | Send (§4.3) |
 | `markRead(id)` | `users.messages.modify` (`removeLabelIds: ['UNREAD']`) | Mark as read (§4.4) |
-| `watch()` | `users.watch` (`topicName`, `labelIds: ['INBOX']`) → `historyId`, `expiration` | Push registration and renewal (§4.5) |
+| `watch()` → `WatchResult` | `users.watch` (`labelFilterBehavior: 'INCLUDE'`) | §4.1, §4.5, §4.6 |
+| `refreshAccessToken()` | `OAuth2Client.refreshAccessToken` | Forced refresh |
+| `markUnread(id)` *(not used in v1)* | `users.messages.modify` (`addLabelIds: ['UNREAD']`) | none |
 
-**Verified:** TypeScript compiles clean (`npm run typecheck`), and the interface defines all required methods (the six above).
+**`MailProviderFactory`** (no account needed):
+- `providerId` and `wellKnownLabels` (`inbox`, `unread`);
+- `forAccount(...)`;
+- `verifyRefreshToken(refreshToken)` → `VerifiedGrant`, for §4.1 steps 3–5;
+- `compareCursors(a, b)`, for the §4.5 stale check and the advance-only rule;
+- *not used in v1:* `buildAuthorizationUrl(...)` and `exchangeAuthorizationCode(code)`, because the frontend signs in through Supabase.
+
+**Also in this unit:**
+- `tests/fakes/fakeProvider.ts`, an in-memory implementation reused by every later unit's tests. It can script failures and forbid all calls.
+- `tests/unit/provider.test.ts`.
+- `jest.config.js`, with ts-jest pointed at `tsconfig.check.json`.
+
+**Verified:** `npm run typecheck` is clean, the fake provider satisfies `MailProviderFactory` (`satisfies` check), the interface defines every method listed above, and `src/providers/provider.ts` contains no provider SDK import and no `any`.
 
 ### 2. Gmail OAuth layer with token persistence listener
 **What:** Everything that gets Google tokens and keeps them current:
@@ -59,9 +82,9 @@
 
 ### 3. Sync and read layer
 **What:** Gets mail from Gmail into the `messages` table and reads it back out as `MessageDTO`s (CONTRACT.md §4.2, §5.1). Its parts:
-- **Parser.** A pure function that turns a Gmail `format=full` message into a `messages` row. It matches headers case-insensitively, walks MIME parts recursively, base64url-decodes `text/plain` and `text/html`, collects attachment metadata, converts `internalDate` from epoch-ms, and derives `is_read` from the `UNREAD` label.
+- **Parser.** Lives in `src/providers/gmail/`, behind `getMessage`. It is a pure function that turns a Gmail `format=full` message into a `ProviderMessage`: it matches headers case-insensitively, walks MIME parts recursively, base64url-decodes `text/plain` and `text/html`, collects attachment metadata, converts `internalDate` from epoch-ms, and derives `isRead` from the `UNREAD` label. `src/sync` then maps `ProviderMessage` to the `messages` row 1:1.
 - **Initial (full) sync.** `listInboxMessageIds(50)` is called once with no paging; Gmail returns IDs newest first. Then `getMessage` is called for each ID, each row is upserted on `(user_id, gmail_id)`, and `last_history_id` is set from the newest message.
-- **Incremental sync.** `listHistory` from `last_history_id`, with a fallback to full sync when Gmail returns 404.
+- **Incremental sync.** `listChanges` from `last_history_id`, with a fallback to full sync when it rejects with `cursor_expired` (Gmail 404).
 - **Read side.** A repository query that returns INBOX rows ordered `(internal_date DESC, gmail_id DESC)` with keyset cursor pagination, mapped to `MessageDTO`. It never calls Gmail.
 - **Triggers.** Sync is push-driven only (CONTRACT.md §3.5): the full sync runs at connect (unit 2) and on the webhook's fallback, and the incremental sync runs from the webhook (unit 4). Nothing polls Gmail.
 
@@ -98,8 +121,8 @@
 ### 5. Send layer
 **What:** `POST /api/v1/messages/send` (CONTRACT.md §4.3):
 - **Validation.** Recipients must be valid addresses, at most 100 in total. CR/LF in any header is rejected to block header injection. At least one of `text`/`html` is required.
-- **MIME builder.** Produces an RFC 2822 message: `From` is the account email from `gmail_accounts.email`, the subject is RFC 2047-encoded, and the body is `multipart/alternative` when both text and HTML are given, a single part otherwise.
-- **Send.** The message is base64url-encoded into `raw` and sent with `MailProvider.sendMessage(raw, threadId?)`.
+- **MIME builder.** Lives in `src/providers/gmail/`, behind `sendMessage(OutgoingMessage)`. It produces an RFC 2822 message: `From` is the account email from `gmail_accounts.email`, the subject is RFC 2047-encoded, and the body is `multipart/alternative` when both text and HTML are given, a single part otherwise.
+- **Send.** `src/send` builds an `OutgoingMessage` and calls `MailProvider.sendMessage`. The Gmail implementation base64url-encodes the MIME into `raw` and passes `threadId`.
 - **Replies.** Gmail threads a reply only when the request carries the original `threadId`, the `In-Reply-To`/`References` headers follow RFC 2822, and the `Subject` matches. So for a reply the builder sets `In-Reply-To` and `References` from the stored original, derives the subject server-side (CONTRACT.md §4.3: `Re: <original subject>` unless it already starts with `Re:`, ignoring any client `subject`), and passes the original's `thread_id`.
 - **Store.** The sent message is fetched back with `getMessage` and upserted through unit 3's parser, then returned as `201 { message }`.
 
