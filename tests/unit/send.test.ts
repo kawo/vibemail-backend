@@ -41,7 +41,8 @@ describe('sendForUser (CONTRACT.md §4.3)', () => {
       subject: 'Hi',
       body_plain: 'Hello',
     });
-    expect(messages.forUser(USER)).toEqual([row]);
+    // The stored row is the written one plus the columns the database generates.
+    expect(messages.forUser(USER)).toEqual([{ ...row, id: expect.any(String), created_at: expect.any(String), updated_at: expect.any(String) }]);
   });
 
   it('passes threadId through unchanged, with no derived reply headers', async () => {

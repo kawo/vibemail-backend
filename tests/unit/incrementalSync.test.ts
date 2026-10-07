@@ -1,6 +1,7 @@
 import type { ChangePage, ProviderChange } from '../../src/providers/provider';
 import { ProviderError } from '../../src/providers/provider';
-import { applyLabelDelta, runIncrementalSync, toMessageRow } from '../../src/sync';
+import { toMessageRow } from '../../src/db/messages';
+import { applyLabelDelta, runIncrementalSync } from '../../src/sync';
 import { createFakeProviderFactory, cursor, fakeMessage } from '../fakes/fakeProvider';
 import { MemoryMessages, MemoryUsers } from '../fakes/memoryRepos';
 

@@ -1,9 +1,6 @@
 import { waitUntil } from '@vercel/functions';
 import { requireEnv } from '../config/env';
-import { getServiceClient } from '../db/client';
-import { keyFromEnv } from '../db/crypto';
-import { type MessagesRepository, createMessagesRepository } from '../db/messages';
-import { type UsersRepository, createUsersRepository } from '../db/users';
+import { type MessagesRepository, type UsersRepository, createDb, getServiceClient, keyFromEnv } from '../db';
 import { gmailAuthConfigFromEnv } from '../providers/gmail/auth';
 import { createGmailProviderFactory } from '../providers/gmail/provider';
 import type { MailProviderFactory } from '../providers/provider';
@@ -31,11 +28,11 @@ export function depsFromEnv(env: NodeJS.ProcessEnv = process.env): AppDeps {
   if (cached) {
     return cached;
   }
-  const db = getServiceClient(env);
+  const db = createDb(getServiceClient(env), keyFromEnv(env));
   cached = {
     factory: createGmailProviderFactory(gmailAuthConfigFromEnv(env)),
-    users: createUsersRepository(db, keyFromEnv(env)),
-    messages: createMessagesRepository(db),
+    users: db.users,
+    messages: db.messages,
     jwtSecret: requireEnv('JWT_SECRET', env),
     supabaseUrl: requireEnv('SUPABASE_URL', env),
     frontendUrl: requireEnv('FRONTEND_URL', env),

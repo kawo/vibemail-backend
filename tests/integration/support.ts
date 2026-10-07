@@ -14,13 +14,13 @@ import fs from 'fs';
 import path from 'path';
 import jwt from 'jsonwebtoken';
 import { type SupabaseClient, createClient } from '@supabase/supabase-js';
-import { type MessageRow, createMessagesRepository } from '../../src/db/messages';
-import { createUsersRepository } from '../../src/db/users';
+import { type MessageWrite, createDb } from '../../src/db';
 import type { AppDeps } from '../../src/http/deps';
 import { createHandlers } from '../../src/http/handlers';
 import { GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE } from '../../src/providers/gmail/auth';
 import type { ProviderMessage, VerifiedGrant } from '../../src/providers/provider';
-import { toMessageRow } from '../../src/sync';
+import { toMessageRow } from '../../src/db/messages';
+import type { Database } from '../../src/types';
 import { type FakeMailbox, createFakeMailbox, createFakeProviderFactory, cursor } from '../fakes/fakeProvider';
 
 export const TEST_JWT_SECRET = 'integration-test-jwt-secret-not-for-production-use';
@@ -55,13 +55,13 @@ export function liveConfig(): { url: string; serviceKey: string } {
   return { url, serviceKey };
 }
 
-let adminClient: SupabaseClient | null = null;
+let adminClient: SupabaseClient<Database> | null = null;
 
 /** Service-role client on the live project. */
-export function admin(): SupabaseClient {
+export function admin(): SupabaseClient<Database> {
   if (!adminClient) {
     const { url, serviceKey } = liveConfig();
-    adminClient = createClient(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
+    adminClient = createClient<Database>(url, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
   }
   return adminClient;
 }
@@ -70,6 +70,8 @@ export interface TestUser {
   userId: string;
   email: string;
   googleId: string;
+  /** Fixed per user, so a seeded grant and an expected one compare equal. */
+  tokenExpiresAt: Date;
 }
 
 const created: string[] = [];
@@ -82,7 +84,7 @@ export async function createTestUser(): Promise<TestUser> {
     throw new Error(`could not create test user: ${error?.message ?? 'no user returned'}`);
   }
   created.push(data.user.id);
-  return { userId: data.user.id, email, googleId: `google-${randomUUID()}` };
+  return { userId: data.user.id, email, googleId: `google-${randomUUID()}`, tokenExpiresAt: new Date(Date.now() + 3600_000) };
 }
 
 /** Deletes every user created in this file; their rows cascade. */
@@ -110,7 +112,7 @@ export function grantFor(user: TestUser, overrides: Partial<VerifiedGrant> = {})
     credentials: {
       refreshToken: `refresh-${user.userId}`,
       accessToken: `access-${user.userId}`,
-      accessTokenExpiresAt: new Date(Date.now() + 3600_000),
+      accessTokenExpiresAt: user.tokenExpiresAt,
     },
     ...overrides,
   };
@@ -128,15 +130,14 @@ export interface App {
  * The real handlers on the live database, with Gmail faked. `grant` is what the fake returns
  * for an OAuth code exchange. `db` defaults to the service-role client.
  */
-export function buildApp(options: { grant?: VerifiedGrant; db?: SupabaseClient; box?: FakeMailbox } = {}): App {
+export function buildApp(options: { grant?: VerifiedGrant; db?: SupabaseClient<Database>; box?: FakeMailbox } = {}): App {
   const db = options.db ?? admin();
   const box = options.box ?? createFakeMailbox();
   const { factory } = createFakeProviderFactory(box, options.grant ? { grant: options.grant } : {});
   const pending: Array<Promise<unknown>> = [];
   const deps: AppDeps = {
     factory,
-    users: createUsersRepository(db, ENCRYPTION_KEY),
-    messages: createMessagesRepository(db),
+    ...createDb(db, ENCRYPTION_KEY),
     jwtSecret: TEST_JWT_SECRET,
     supabaseUrl: liveConfig().url,
     frontendUrl: FRONTEND_URL,
@@ -154,7 +155,7 @@ export function buildApp(options: { grant?: VerifiedGrant; db?: SupabaseClient; 
 /** The same app on a client with an invalid key: every DB call fails for real, giving `INTERNAL`. */
 export function buildBrokenDbApp(options: { grant?: VerifiedGrant; box?: FakeMailbox } = {}): App {
   const { url } = liveConfig();
-  const broken = createClient(url, 'invalid-service-role-key', { auth: { persistSession: false } });
+  const broken = createClient<Database>(url, 'invalid-service-role-key', { auth: { persistSession: false } });
   return buildApp({ ...options, db: broken });
 }
 
@@ -176,14 +177,14 @@ export async function seedConnectedUser(
     throw new Error(`seed failed: ${outcome}`);
   }
   if (state.historyId) {
-    await app.deps.users.recordSync(user.userId, state.historyId, new Date());
+    await app.deps.users.updateHistoryId(user.userId, state.historyId, new Date());
   }
   if (state.watch) {
-    await app.deps.users.updateWatch(user.userId, state.watch);
+    await app.deps.users.updateWatchExpiry(user.userId, state.watch);
   }
 }
 
-export async function seedMessages(app: App, user: TestUser, messages: ProviderMessage[]): Promise<MessageRow[]> {
+export async function seedMessages(app: App, user: TestUser, messages: ProviderMessage[]): Promise<MessageWrite[]> {
   const rows = messages.map((m) => toMessageRow(user.userId, m, new Date()));
   await app.deps.messages.upsertMessages(user.userId, rows);
   return rows;

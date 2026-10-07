@@ -1,5 +1,6 @@
 import { ProviderError } from '../../src/providers/provider';
-import { INITIAL_SYNC_LIMIT, runInitialSync, toMessageRow } from '../../src/sync';
+import { toMessageRow } from '../../src/db/messages';
+import { INITIAL_SYNC_LIMIT, runInitialSync } from '../../src/sync';
 import { createFakeProviderFactory, cursor, fakeMessage } from '../fakes/fakeProvider';
 import { MemoryMessages, MemoryUsers } from '../fakes/memoryRepos';
 
@@ -42,6 +43,25 @@ describe('runInitialSync (CONTRACT.md §3.5)', () => {
     expect(stored).toContain('m79');
     expect(stored).toContain('m30');
     expect(stored).not.toContain('m29');
+  });
+
+  it('writes only through the database layer: upsertMessage per message, then updateHistoryId', async () => {
+    const { deps, messages, users } = setup(3);
+    const upsertMessage = jest.spyOn(messages, 'upsertMessage');
+    const upsertMessages = jest.spyOn(messages, 'upsertMessages');
+    const updateHistoryId = jest.spyOn(users, 'updateHistoryId');
+    await runInitialSync(deps, USER);
+    expect(upsertMessage.mock.calls.map(([userId, message]) => [userId, message.id])).toEqual([
+      [USER, 'm2'],
+      [USER, 'm1'],
+      [USER, 'm0'],
+    ]);
+    expect(upsertMessages.mock.calls.every(([, rows]) => rows.length === 1)).toBe(true);
+    expect(updateHistoryId).toHaveBeenCalledWith(USER, '1002', syncedAt);
+    expect(messages.forUser(USER).find((r) => r.gmail_id === 'm2')).toMatchObject({
+      from_address: 'Sender <sender@example.com>',
+      to_address: ['me@example.com'],
+    });
   });
 
   it('sets users.history_id from the newest message, with last_synced_at', async () => {

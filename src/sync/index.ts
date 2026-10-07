@@ -1,4 +1,4 @@
-import type { MessageRow, MessagesRepository } from '../db/messages';
+import type { MessagesRepository } from '../db/messages';
 import type { UsersRepository } from '../db/users';
 import {
   type MailProvider,
@@ -9,7 +9,11 @@ import {
   ProviderError,
 } from '../providers/provider';
 
-/** Initial (full) and incremental sync, CONTRACT.md §3.5. */
+/**
+ * Initial (full) and incremental sync, CONTRACT.md §3.5. Sync never touches Supabase itself:
+ * normalised messages go through `messages.upsertMessage` (which maps `from`/`to` to
+ * `from_address`/`to_address`, §5.1), and the sync position through `users.updateHistoryId`.
+ */
 
 export const INITIAL_SYNC_LIMIT = 50;
 
@@ -27,35 +31,6 @@ export interface InitialSyncResult {
   skipped: number;
   /** The stored `users.history_id` afterwards; null for an empty inbox. */
   historyId: SyncCursor | null;
-}
-
-/** Maps a normalized message to a `messages` row (CONTRACT.md §5.1 column names). */
-export function toMessageRow(userId: string, message: ProviderMessage, syncedAt: Date): MessageRow {
-  return {
-    user_id: userId,
-    gmail_id: message.id,
-    thread_id: message.threadId,
-    label_ids: message.labels,
-    is_read: message.isRead,
-    is_starred: message.isStarred,
-    snippet: message.snippet,
-    history_id: message.syncCursor,
-    internal_date: message.receivedAt.toISOString(),
-    size_estimate: message.sizeBytes,
-    subject: message.subject,
-    from_address: message.from,
-    to_address: message.to,
-    cc_addresses: message.cc,
-    bcc_addresses: message.bcc,
-    rfc822_message_id: message.rfc822MessageId,
-    in_reply_to: message.inReplyTo,
-    references: message.references,
-    date_header: message.dateHeader,
-    body_plain: message.bodyText,
-    body_html: message.bodyHtml,
-    attachments: message.attachments,
-    synced_at: syncedAt.toISOString(),
-  };
 }
 
 /**
@@ -82,10 +57,9 @@ export async function runInitialSync(deps: SyncDeps, userId: string): Promise<In
   }
 
   const syncedAt = now();
-  await deps.messages.upsertMessages(
-    userId,
-    fetched.map((message) => toMessageRow(userId, message, syncedAt)),
-  );
+  for (const message of fetched) {
+    await deps.messages.upsertMessage(userId, message, syncedAt);
+  }
 
   // IDs are newest first, so the first fetched message is the newest.
   const newest = fetched[0]?.syncCursor ?? null;
@@ -95,7 +69,7 @@ export async function runInitialSync(deps: SyncDeps, userId: string): Promise<In
   const current = (await deps.users.getHistoryId(userId)) as SyncCursor | null;
   const historyId =
     current !== null && deps.factory.compareCursors(current, newest) > 0 ? current : newest;
-  await deps.users.recordSync(userId, historyId, syncedAt);
+  await deps.users.updateHistoryId(userId, historyId, syncedAt);
   return { stored: fetched.length, skipped, historyId };
 }
 
@@ -148,7 +122,7 @@ export async function runIncrementalSync(
   const fetchAndStore = async (gmailId: string): Promise<void> => {
     try {
       const message = await deps.provider.getMessage(gmailId);
-      await deps.messages.upsertMessages(userId, [toMessageRow(userId, message, now())]);
+      await deps.messages.upsertMessage(userId, message, now());
       applied += 1;
     } catch (error) {
       if (error instanceof ProviderError && error.kind === 'not_found') {
@@ -192,6 +166,6 @@ export async function runIncrementalSync(
 
   const stored = (await deps.users.getHistoryId(userId)) as SyncCursor | null;
   const historyId = stored !== null && deps.factory.compareCursors(stored, cursor) > 0 ? stored : cursor;
-  await deps.users.recordSync(userId, historyId, now());
+  await deps.users.updateHistoryId(userId, historyId, now());
   return { applied, skipped, historyId };
 }

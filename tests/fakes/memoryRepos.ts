@@ -1,4 +1,4 @@
-import type { ListCursor, MessageRow, MessagesRepository } from '../../src/db/messages';
+import { type ListCursor, type MessageRow, type MessageWrite, type MessagesRepository, toMessageRow } from '../../src/db/messages';
 import type {
   ConnectedAccount,
   ConnectedUserInput,
@@ -6,7 +6,8 @@ import type {
   UpsertResult,
   UsersRepository,
 } from '../../src/db/users';
-import type { AccountCredentials, TokenUpdate } from '../../src/providers/provider';
+import type { AccountCredentials, ProviderMessage, TokenUpdate } from '../../src/providers/provider';
+import type { UserRow } from '../../src/types';
 
 export interface MemoryUserRow extends ConnectedUserInput {
   watch?: Date;
@@ -37,11 +38,32 @@ export class MemoryUsers implements UsersRepository {
     }
     return this.rows.get(userId)?.credentials ?? null;
   }
-  async updateWatch(userId: string, expiresAt: Date): Promise<void> {
+  async updateWatchExpiry(userId: string, expiresAt: Date): Promise<void> {
     const row = this.rows.get(userId);
     if (row) {
       row.watch = expiresAt;
     }
+  }
+  async getUser(userId: string): Promise<UserRow | null> {
+    const row = this.rows.get(userId);
+    if (!row) {
+      return null;
+    }
+    const at = new Date(0).toISOString();
+    return {
+      google_id: row.googleId,
+      user_id: row.userId,
+      email: row.email,
+      scopes: row.scopes,
+      refresh_token: this.cleared.includes(userId) ? null : 'encrypted',
+      access_token: null,
+      access_token_expires_at: null,
+      history_id: row.historyId,
+      last_synced_at: row.lastSyncedAt ? row.lastSyncedAt.toISOString() : null,
+      watch_expiration: row.watch ? row.watch.toISOString() : null,
+      created_at: at,
+      updated_at: at,
+    };
   }
   async getUserEmail(userId: string): Promise<string | null> {
     return this.rows.get(userId)?.email ?? null;
@@ -52,7 +74,7 @@ export class MemoryUsers implements UsersRepository {
   async getHistoryId(userId: string): Promise<string | null> {
     return this.rows.get(userId)?.historyId ?? null;
   }
-  async recordSync(userId: string, historyId: string, syncedAt: Date): Promise<void> {
+  async updateHistoryId(userId: string, historyId: string, syncedAt: Date): Promise<void> {
     const row = this.rows.get(userId);
     if (row) {
       row.historyId = historyId;
@@ -106,13 +128,20 @@ export class MemoryMessages implements MessagesRepository {
   async getMessage(userId: string, gmailId: string): Promise<MessageRow | null> {
     return this.rows.get(MemoryMessages.key(userId, gmailId)) ?? null;
   }
-  async upsertMessages(userId: string, rows: MessageRow[]): Promise<void> {
+  async upsertMessage(userId: string, message: ProviderMessage, syncedAt: Date): Promise<MessageWrite> {
+    const row = toMessageRow(userId, message, syncedAt);
+    await this.upsertMessages(userId, [row]);
+    return row;
+  }
+  async upsertMessages(userId: string, rows: MessageWrite[]): Promise<void> {
     this.upsertCalls += 1;
     for (const row of rows) {
       if (row.user_id !== userId) {
         throw new Error('row user_id does not match the scoped user');
       }
-      this.rows.set(MemoryMessages.key(row.user_id, row.gmail_id), row);
+      const key = MemoryMessages.key(row.user_id, row.gmail_id);
+      const at = new Date(0).toISOString();
+      this.rows.set(key, { ...row, id: this.rows.get(key)?.id ?? key, created_at: at, updated_at: at });
     }
   }
   async deleteMessage(userId: string, gmailId: string): Promise<void> {

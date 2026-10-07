@@ -5,7 +5,7 @@
  */
 import type { gmail_v1 } from 'googleapis';
 import { decodeBase64Url, parseGmailMessage } from '../../src/providers/gmail/messages';
-import { toMessageRow } from '../../src/sync';
+import { toMessageRow } from '../../src/db/messages';
 
 const syncedAt = new Date('2026-10-06T10:00:00.000Z');
 

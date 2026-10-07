@@ -1,35 +1,12 @@
-import type { MessageRow } from '../db/messages';
-import type { AttachmentMeta } from '../providers/provider';
+import type { MessageWrite } from '../db/messages';
+import type { MessageDTO } from '../types';
 
-/** CONTRACT.md §3.4: the `messages` row in camelCase, without internal columns. */
-export interface MessageDTO {
-  gmailId: string;
-  threadId: string;
-  labelIds: string[];
-  isRead: boolean;
-  isStarred: boolean;
-  snippet: string;
-  historyId: string;
-  internalDate: string;
-  sizeEstimate: number;
-  subject: string | null;
-  fromAddress: string;
-  toAddress: string[];
-  ccAddresses: string[];
-  bccAddresses: string[];
-  rfc822MessageId: string | null;
-  inReplyTo: string | null;
-  references: string | null;
-  dateHeader: string | null;
-  bodyPlain: string | null;
-  bodyHtml: string | null;
-  attachments: AttachmentMeta[];
-  syncedAt: string;
-}
+export type { MessageDTO };
 
 const iso = (value: string): string => new Date(value).toISOString();
 
-export function toMessageDTO(row: MessageRow): MessageDTO {
+/** CONTRACT.md §3.4: a stored or just-written row, in camelCase, without internal columns. */
+export function toMessageDTO(row: MessageWrite): MessageDTO {
   return {
     gmailId: row.gmail_id,
     threadId: row.thread_id,

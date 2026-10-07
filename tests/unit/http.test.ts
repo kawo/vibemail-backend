@@ -3,7 +3,7 @@ import { MissingEnvError } from '../../src/config/env';
 import type { AppDeps } from '../../src/http/deps';
 import { createHandlers } from '../../src/http/handlers';
 import { issueState } from '../../src/middleware/oauthState';
-import { toMessageRow } from '../../src/sync';
+import { toMessageRow } from '../../src/db/messages';
 import { createFakeProviderFactory, fakeMessage } from '../fakes/fakeProvider';
 import { MemoryMessages, MemoryUsers } from '../fakes/memoryRepos';
 

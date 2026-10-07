@@ -1,41 +1,18 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { AttachmentMeta } from '../providers/provider';
+import type { ProviderMessage } from '../providers/provider';
+import type { AttachmentMeta, Database, MessageRow } from '../types';
 import { DatabaseError } from './users';
 
 /**
  * Repository for the `messages` table (CONTRACT.md §5.1). Upserts conflict on
  * `(user_id, gmail_id)`, so two users holding the same Gmail message ID never collide (§5.3).
+ * Row shapes come from the generated `src/types/` (`MessageRow` narrows `attachments`).
  */
 
-/**
- * A `messages` row as written by sync. Defined locally because `src/types/` belongs to the
- * schema session; replace with the generated row type after the merge.
- */
-export interface MessageRow {
-  user_id: string;
-  gmail_id: string;
-  thread_id: string;
-  label_ids: string[];
-  is_read: boolean;
-  is_starred: boolean;
-  snippet: string;
-  history_id: string;
-  internal_date: string;
-  size_estimate: number;
-  subject: string | null;
-  from_address: string;
-  to_address: string[];
-  cc_addresses: string[];
-  bcc_addresses: string[];
-  rfc822_message_id: string | null;
-  in_reply_to: string | null;
-  references: string | null;
-  date_header: string | null;
-  body_plain: string | null;
-  body_html: string | null;
-  attachments: AttachmentMeta[];
-  synced_at: string;
-}
+export type { MessageRow };
+
+/** A row as written: every column except the ones the database generates. */
+export type MessageWrite = Omit<MessageRow, 'id' | 'created_at' | 'updated_at'>;
 
 /** Keyset position for list pagination: `(internal_date DESC, gmail_id DESC)`. */
 export interface ListCursor {
@@ -43,13 +20,54 @@ export interface ListCursor {
   gmailId: string;
 }
 
+/**
+ * Maps a normalized message to the §5.1 columns: `from` → `from_address`, `to` → `to_address`,
+ * `bodyText` → `body_plain`, flags from labels.
+ */
+export function toMessageRow(userId: string, message: ProviderMessage, syncedAt: Date): MessageWrite {
+  const attachments: AttachmentMeta[] = message.attachments.map((a) => ({
+    partId: a.partId,
+    filename: a.filename,
+    mimeType: a.mimeType,
+    size: a.size,
+    attachmentId: a.attachmentId,
+  }));
+  return {
+    user_id: userId,
+    gmail_id: message.id,
+    thread_id: message.threadId,
+    label_ids: message.labels,
+    is_read: message.isRead,
+    is_starred: message.isStarred,
+    snippet: message.snippet,
+    history_id: message.syncCursor,
+    internal_date: message.receivedAt.toISOString(),
+    size_estimate: message.sizeBytes,
+    subject: message.subject,
+    from_address: message.from,
+    to_address: message.to,
+    cc_addresses: message.cc,
+    bcc_addresses: message.bcc,
+    rfc822_message_id: message.rfc822MessageId,
+    in_reply_to: message.inReplyTo,
+    references: message.references,
+    date_header: message.dateHeader,
+    body_plain: message.bodyText,
+    body_html: message.bodyHtml,
+    attachments,
+    synced_at: syncedAt.toISOString(),
+  };
+}
+
 export interface MessagesRepository {
   /** INBOX rows, newest first, strictly after `after`. Returns at most `limit` rows. */
   listInbox(userId: string, limit: number, after: ListCursor | null): Promise<MessageRow[]>;
   /** One stored message, or null. */
   getMessage(userId: string, gmailId: string): Promise<MessageRow | null>;
-  /** Upserts rows on `(user_id, gmail_id)`. Every row must belong to `userId`. */
-  upsertMessages(userId: string, rows: MessageRow[]): Promise<void>;
+  /** Maps one normalized message (§5.1) and upserts it on `(user_id, gmail_id)`. Returns the written row. */
+  upsertMessage(userId: string, message: ProviderMessage, syncedAt: Date): Promise<MessageWrite>;
+  /** Upserts already-mapped rows on `(user_id, gmail_id)`. Every row must belong to `userId`. */
+  upsertMessages(userId: string, rows: MessageWrite[]): Promise<void>;
   deleteMessage(userId: string, gmailId: string): Promise<void>;
   /** Stored labels of one message, or null when it is not stored. */
   getLabels(userId: string, gmailId: string): Promise<string[] | null>;
@@ -61,14 +79,25 @@ export interface MessagesRepository {
   ): Promise<void>;
 }
 
-export function createMessagesRepository(db: SupabaseClient): MessagesRepository {
+export function createMessagesRepository(db: SupabaseClient<Database>): MessagesRepository {
+  const table = () => db.from('messages');
+
+  async function upsertRows(userId: string, rows: MessageWrite[]): Promise<void> {
+    if (rows.length === 0) {
+      return;
+    }
+    if (rows.some((row) => row.user_id !== userId)) {
+      throw new DatabaseError('messages upsert', new Error('row user_id does not match the scoped user'));
+    }
+    const { error } = await table().upsert(rows, { onConflict: 'user_id,gmail_id' });
+    if (error) {
+      throw new DatabaseError('messages upsert', error);
+    }
+  }
+
   return {
     async listInbox(userId, limit, after) {
-      let query = db
-        .from('messages')
-        .select('*')
-        .eq('user_id', userId)
-        .contains('label_ids', ['INBOX']);
+      let query = table().select('*').eq('user_id', userId).contains('label_ids', ['INBOX']);
       if (after) {
         // Values are an ISO timestamp and a Gmail ID: neither contains PostgREST filter syntax.
         query = query.or(
@@ -87,40 +116,32 @@ export function createMessagesRepository(db: SupabaseClient): MessagesRepository
     },
 
     async getMessage(userId, gmailId) {
-      const { data, error } = await db
-        .from('messages')
+      const { data, error } = await table()
         .select('*')
         .eq('user_id', userId)
         .eq('gmail_id', gmailId)
-        .limit(1)
-        .overrideTypes<MessageRow[], { merge: false }>();
+        .maybeSingle()
+        .overrideTypes<MessageRow | null, { merge: false }>();
       if (error) {
         throw new DatabaseError('messages lookup', error);
       }
-      return data?.[0] ?? null;
+      return data;
     },
 
-    async upsertMessages(userId, rows) {
-      if (rows.length === 0) {
-        return;
-      }
-      if (rows.some((row) => row.user_id !== userId)) {
-        throw new DatabaseError('messages upsert', new Error('row user_id does not match the scoped user'));
-      }
-      const { error } = await db.from('messages').upsert(rows, { onConflict: 'user_id,gmail_id' });
-      if (error) {
-        throw new DatabaseError('messages upsert', error);
-      }
+    async upsertMessage(userId, message, syncedAt) {
+      const row = toMessageRow(userId, message, syncedAt);
+      await upsertRows(userId, [row]);
+      return row;
     },
+
+    upsertMessages: upsertRows,
 
     async getLabels(userId, gmailId) {
-      const { data, error } = await db
-        .from('messages')
+      const { data, error } = await table()
         .select('label_ids')
         .eq('user_id', userId)
         .eq('gmail_id', gmailId)
-        .maybeSingle()
-        .overrideTypes<{ label_ids: string[] } | null, { merge: false }>();
+        .maybeSingle();
       if (error) {
         throw new DatabaseError('messages label lookup', error);
       }
@@ -128,8 +149,7 @@ export function createMessagesRepository(db: SupabaseClient): MessagesRepository
     },
 
     async updateLabels(userId, gmailId, update) {
-      const { error } = await db
-        .from('messages')
+      const { error } = await table()
         .update({
           label_ids: update.labels,
           is_read: update.isRead,
@@ -144,7 +164,7 @@ export function createMessagesRepository(db: SupabaseClient): MessagesRepository
     },
 
     async deleteMessage(userId, gmailId) {
-      const { error } = await db.from('messages').delete().eq('user_id', userId).eq('gmail_id', gmailId);
+      const { error } = await table().delete().eq('user_id', userId).eq('gmail_id', gmailId);
       if (error) {
         throw new DatabaseError('messages delete', error);
       }

@@ -1,9 +1,8 @@
-import type { MessageRow, MessagesRepository } from '../db/messages';
+import type { MessageWrite, MessagesRepository } from '../db/messages';
 import type { UsersRepository } from '../db/users';
 import { ApiError } from '../middleware/errors';
 import { type MailProviderFactory, ProviderError } from '../providers/provider';
 import { apiErrorFromProvider, providerForUser } from '../services/gmailAccount';
-import { toMessageRow } from '../sync';
 
 /** Send layer, CONTRACT.md §4.3: validate, send through the user's provider, store the sent message. */
 
@@ -103,7 +102,7 @@ const defaultLog = (message: string, error: unknown): void => {
  * `id`, `threadId` and `labelIds`, so the sent message is fetched back with `getMessage` and
  * normalized like synced mail.
  */
-export async function sendForUser(deps: SendDeps, userId: string, input: unknown): Promise<MessageRow> {
+export async function sendForUser(deps: SendDeps, userId: string, input: unknown): Promise<MessageWrite> {
   const log = deps.log ?? defaultLog;
   const now = deps.now ?? (() => new Date());
   const request = validateSendInput(input);
@@ -141,9 +140,7 @@ export async function sendForUser(deps: SendDeps, userId: string, input: unknown
   // The message is sent. From here on, every failure reports sentGmailId so the client never resends.
   try {
     const message = await provider.getMessage(sent.id);
-    const row = toMessageRow(userId, message, now());
-    await deps.messages.upsertMessages(userId, [row]);
-    return row;
+    return await deps.messages.upsertMessage(userId, message, now());
   } catch (error) {
     log('storing a sent message failed', error);
     const details = { sentGmailId: sent.id };

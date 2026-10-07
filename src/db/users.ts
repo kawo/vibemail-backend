@@ -1,25 +1,20 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AccountCredentials, TokenUpdate } from '../providers/provider';
+import type { Database, UserRow } from '../types';
 import { TokenDecryptionError, decryptToken, encryptToken } from './crypto';
 
 /**
  * Repository for the `users` table (CONTRACT.md §5.2). All SQL for it lives here, every
  * user-scoped query filters on `user_id` (§5.3), and tokens are encrypted on write and
- * decrypted on read (§5.4).
+ * decrypted on read (§5.4). Row shapes come from the generated `src/types/database.ts`.
  */
 
-/**
- * Columns this repository reads. Defined locally because `src/types/` belongs to the schema
- * session and does not exist on `main`; replace with the generated row type after the merge.
- */
-interface UserTokenRow {
-  google_id: string;
-  history_id?: string | null;
-  user_id: string;
-  refresh_token: string | null;
-  access_token: string | null;
-  access_token_expires_at: string | null;
-}
+/** The columns needed to decide linking and to decrypt credentials. */
+type TokenColumns = Pick<
+  UserRow,
+  'google_id' | 'user_id' | 'history_id' | 'refresh_token' | 'access_token' | 'access_token_expires_at'
+>;
+const TOKEN_COLUMNS = 'google_id, user_id, history_id, refresh_token, access_token, access_token_expires_at';
 
 export interface ConnectedUserInput {
   googleId: string;
@@ -46,19 +41,28 @@ export type UpsertResult = 'ok' | 'google_account_linked_elsewhere' | 'another_g
 
 export interface UsersRepository {
   upsertConnectedUser(input: ConnectedUserInput): Promise<UpsertResult>;
-  /** Persists a token refresh. Writes the access token and its expiry as a pair (§3.1). */
+  /** The user's `users` row as stored (tokens still encrypted), or null. */
+  getUser(userId: string): Promise<UserRow | null>;
+  /**
+   * Persists a token refresh; called by the token persistence listener. Encrypts the access
+   * token, writes it with its expiry as a pair (§3.1), and the refresh token only when rotated.
+   */
   updateUserTokens(userId: string, update: TokenUpdate): Promise<void>;
   /** Decrypted credentials, or null when the user has no row or no refresh token. */
   getUserCredentials(userId: string): Promise<AccountCredentials | null>;
-  updateWatch(userId: string, expiresAt: Date): Promise<void>;
+  /** After a watch registration or renewal: writes `watch_expiration`. Gmail returns no resource ID. */
+  updateWatchExpiry(userId: string, expiresAt: Date): Promise<void>;
   /** The connected mailbox address (`users.email`), or null when the user has no row. */
   getUserEmail(userId: string): Promise<string | null>;
   /** When the last sync completed (`last_synced_at`), or null. */
   getLastSyncedAt(userId: string): Promise<Date | null>;
   /** The stored sync position (`history_id`), or null when a full sync is needed. */
   getHistoryId(userId: string): Promise<string | null>;
-  /** Records a completed sync: sets `history_id` and `last_synced_at`. Callers enforce advance-only. */
-  recordSync(userId: string, historyId: string, syncedAt: Date): Promise<void>;
+  /**
+   * After each sync: writes `users.history_id` and `last_synced_at`. Callers enforce advance-only
+   * (CONTRACT.md §4.5 step 6).
+   */
+  updateHistoryId(userId: string, historyId: string, syncedAt: Date): Promise<void>;
   /**
    * Unscoped lookup by mailbox email, for the webhook only (§5.3). Null when there is no row
    * or no refresh token.
@@ -86,22 +90,19 @@ export class DatabaseError extends Error {
 
 const UNIQUE_VIOLATION = '23505';
 
-export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRepository {
+export function createUsersRepository(db: SupabaseClient<Database>, key: Buffer): UsersRepository {
   const table = () => db.from('users');
+  const touched = () => new Date().toISOString();
 
-  async function findBy(column: 'google_id' | 'user_id', value: string): Promise<UserTokenRow | null> {
-    const { data, error } = await table()
-      .select('google_id, user_id, refresh_token, access_token, access_token_expires_at')
-      .eq(column, value)
-      .maybeSingle()
-      .overrideTypes<UserTokenRow | null, { merge: false }>();
+  async function findBy(column: 'google_id' | 'user_id', value: string): Promise<TokenColumns | null> {
+    const { data, error } = await table().select(TOKEN_COLUMNS).eq(column, value).maybeSingle();
     if (error) {
       throw new DatabaseError(`users lookup by ${column}`, error);
     }
     return data;
   }
 
-  function credentialsOf(row: UserTokenRow): AccountCredentials | null {
+  function credentialsOf(row: TokenColumns): AccountCredentials | null {
     if (row.refresh_token === null) {
       return null;
     }
@@ -111,6 +112,15 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
       accessToken: paired && row.access_token ? decryptToken(row.access_token, key) : null,
       accessTokenExpiresAt: paired && row.access_token_expires_at ? new Date(row.access_token_expires_at) : null,
     };
+  }
+
+  async function update(userId: string, operation: string, values: Database['public']['Tables']['users']['Update']) {
+    const { error } = await table()
+      .update({ ...values, updated_at: touched() })
+      .eq('user_id', userId);
+    if (error) {
+      throw new DatabaseError(operation, error);
+    }
   }
 
   return {
@@ -126,6 +136,7 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
       }
 
       const { credentials } = input;
+      const paired = credentials.accessToken !== null && credentials.accessTokenExpiresAt !== null;
       const { error } = await table().upsert(
         {
           google_id: input.googleId,
@@ -133,17 +144,12 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
           email: input.email,
           scopes: input.scopes,
           refresh_token: encryptToken(credentials.refreshToken, key),
-          access_token:
-            credentials.accessToken && credentials.accessTokenExpiresAt
-              ? encryptToken(credentials.accessToken, key)
-              : null,
+          access_token: paired && credentials.accessToken ? encryptToken(credentials.accessToken, key) : null,
           access_token_expires_at:
-            credentials.accessToken && credentials.accessTokenExpiresAt
-              ? credentials.accessTokenExpiresAt.toISOString()
-              : null,
+            paired && credentials.accessTokenExpiresAt ? credentials.accessTokenExpiresAt.toISOString() : null,
           // Re-connect forces a full sync (§4.1).
           history_id: null,
-          updated_at: new Date().toISOString(),
+          updated_at: touched(),
         },
         { onConflict: 'google_id' },
       );
@@ -158,18 +164,20 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
       return 'ok';
     },
 
-    async updateUserTokens(userId, update) {
-      const { error } = await table()
-        .update({
-          access_token: encryptToken(update.accessToken, key),
-          access_token_expires_at: update.accessTokenExpiresAt.toISOString(),
-          ...(update.refreshToken ? { refresh_token: encryptToken(update.refreshToken, key) } : {}),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('user_id', userId);
+    async getUser(userId) {
+      const { data, error } = await table().select('*').eq('user_id', userId).maybeSingle();
       if (error) {
-        throw new DatabaseError('users token update', error);
+        throw new DatabaseError('users lookup', error);
       }
+      return data;
+    },
+
+    async updateUserTokens(userId, tokens) {
+      await update(userId, 'users token update', {
+        access_token: encryptToken(tokens.accessToken, key),
+        access_token_expires_at: tokens.accessTokenExpiresAt.toISOString(),
+        ...(tokens.refreshToken ? { refresh_token: encryptToken(tokens.refreshToken, key) } : {}),
+      });
     },
 
     async getUserCredentials(userId) {
@@ -178,11 +186,7 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
     },
 
     async findAccountByEmailUnscoped(email) {
-      const { data, error } = await table()
-        .select('google_id, user_id, history_id, refresh_token, access_token, access_token_expires_at')
-        .eq('email', email)
-        .maybeSingle()
-        .overrideTypes<UserTokenRow | null, { merge: false }>();
+      const { data, error } = await table().select(TOKEN_COLUMNS).eq('email', email).maybeSingle();
       if (error) {
         throw new DatabaseError('users lookup by email', error);
       }
@@ -190,24 +194,15 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
       if (!data || !credentials) {
         return null;
       }
-      return { userId: data.user_id, historyId: data.history_id ?? null, credentials };
+      return { userId: data.user_id, historyId: data.history_id, credentials };
     },
 
-    async updateWatch(userId, expiresAt) {
-      const { error } = await table()
-        .update({ watch_expiration: expiresAt.toISOString(), updated_at: new Date().toISOString() })
-        .eq('user_id', userId);
-      if (error) {
-        throw new DatabaseError('users watch update', error);
-      }
+    async updateWatchExpiry(userId, expiresAt) {
+      await update(userId, 'users watch update', { watch_expiration: expiresAt.toISOString() });
     },
 
     async getUserEmail(userId) {
-      const { data, error } = await table()
-        .select('email')
-        .eq('user_id', userId)
-        .maybeSingle()
-        .overrideTypes<{ email: string } | null, { merge: false }>();
+      const { data, error } = await table().select('email').eq('user_id', userId).maybeSingle();
       if (error) {
         throw new DatabaseError('users email lookup', error);
       }
@@ -215,11 +210,7 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
     },
 
     async getLastSyncedAt(userId) {
-      const { data, error } = await table()
-        .select('last_synced_at')
-        .eq('user_id', userId)
-        .maybeSingle()
-        .overrideTypes<{ last_synced_at: string | null } | null, { merge: false }>();
+      const { data, error } = await table().select('last_synced_at').eq('user_id', userId).maybeSingle();
       if (error) {
         throw new DatabaseError('users last_synced_at lookup', error);
       }
@@ -227,36 +218,25 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
     },
 
     async getHistoryId(userId) {
-      const { data, error } = await table()
-        .select('history_id')
-        .eq('user_id', userId)
-        .maybeSingle()
-        .overrideTypes<{ history_id: string | null } | null, { merge: false }>();
+      const { data, error } = await table().select('history_id').eq('user_id', userId).maybeSingle();
       if (error) {
         throw new DatabaseError('users history_id lookup', error);
       }
       return data?.history_id ?? null;
     },
 
-    async recordSync(userId, historyId, syncedAt) {
-      const { error } = await table()
-        .update({
-          history_id: historyId,
-          last_synced_at: syncedAt.toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq('user_id', userId);
-      if (error) {
-        throw new DatabaseError('users sync record', error);
-      }
+    async updateHistoryId(userId, historyId, syncedAt) {
+      await update(userId, 'users history_id update', {
+        history_id: historyId,
+        last_synced_at: syncedAt.toISOString(),
+      });
     },
 
     async listConnectedAccountsUnscoped({ watchExpiringBefore }) {
       const { data, error } = await table()
-        .select('google_id, user_id, refresh_token, access_token, access_token_expires_at')
+        .select(TOKEN_COLUMNS)
         .not('refresh_token', 'is', null)
-        .or(`watch_expiration.is.null,watch_expiration.lt.${watchExpiringBefore.toISOString()}`)
-        .overrideTypes<UserTokenRow[], { merge: false }>();
+        .or(`watch_expiration.is.null,watch_expiration.lt.${watchExpiringBefore.toISOString()}`);
       if (error) {
         throw new DatabaseError('users renewal candidates', error);
       }
@@ -273,17 +253,11 @@ export function createUsersRepository(db: SupabaseClient, key: Buffer): UsersRep
     },
 
     async clearUserTokens(userId) {
-      const { error } = await table()
-        .update({
-          refresh_token: null,
-          access_token: null,
-          access_token_expires_at: null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('user_id', userId);
-      if (error) {
-        throw new DatabaseError('users token clear', error);
-      }
+      await update(userId, 'users token clear', {
+        refresh_token: null,
+        access_token: null,
+        access_token_expires_at: null,
+      });
     },
   };
 }

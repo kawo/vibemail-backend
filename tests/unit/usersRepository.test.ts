@@ -1,5 +1,6 @@
 import { randomBytes } from 'crypto';
 import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Database } from '../../src/types';
 import { decryptToken, encryptToken } from '../../src/db/crypto';
 import { createUsersRepository } from '../../src/db/users';
 
@@ -22,8 +23,7 @@ function fakeDb(rows: Row[], upsertError: { code: string; message: string } | nu
         op.filters.push([column, value]);
         return chain;
       },
-      maybeSingle: () => chain,
-      overrideTypes: async () => ({ data: match(), error: null }),
+      maybeSingle: async () => ({ data: match(), error: null }),
       then: (resolve: (v: { error: null }) => unknown) => resolve({ error: null }),
     };
     return chain;
@@ -46,7 +46,7 @@ function fakeDb(rows: Row[], upsertError: { code: string; message: string } | nu
       },
     }),
   };
-  return { db: db as unknown as SupabaseClient, ops };
+  return { db: db as unknown as SupabaseClient<Database>, ops };
 }
 
 const key = randomBytes(32);

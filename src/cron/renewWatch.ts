@@ -56,7 +56,7 @@ async function renewOne(deps: RenewDeps, candidate: RenewalCandidate, log: NonNu
   const provider = deps.factory.forAccount(candidate.credentials, persistTokensFor(deps.users, candidate.userId));
   try {
     const watch = await provider.watch();
-    await deps.users.updateWatch(candidate.userId, watch.expiresAt);
+    await deps.users.updateWatchExpiry(candidate.userId, watch.expiresAt);
     return 'renewed';
   } catch (error) {
     if (error instanceof ProviderError && error.kind === 'revoked') {

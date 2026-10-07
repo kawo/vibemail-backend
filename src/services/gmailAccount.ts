@@ -125,7 +125,7 @@ export async function connectGmailAccount(deps: GmailAccountDeps, input: Connect
   let watchExpiration: Date | null = null;
   try {
     const watch = await provider.watch();
-    await deps.users.updateWatch(input.userId, watch.expiresAt);
+    await deps.users.updateWatchExpiry(input.userId, watch.expiresAt);
     watchExpiration = watch.expiresAt;
   } catch (error) {
     log('watch registration failed after connect', error);
