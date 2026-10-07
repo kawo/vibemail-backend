@@ -36,25 +36,25 @@ The project is complete when **every** item below is true and verifiable.
 
 1. All six routes exist at the exact paths in §4 and accept/return exactly the shapes defined there.
 2. Every `ErrorCode` listed in an endpoint's error table has at least one Jest test that triggers it and asserts the HTTP status and the error envelope from §3.3.
-3. `jest --ci --runInBand` passes (TypeScript via `ts-jest`, TypeScript pinned to 6.x because `ts-jest` does not support 7), including integration tests running against local Supabase (`supabase start`) with the `schema` branch's migration applied, in the §6 Gate 1 worktree.
+3. `jest --ci --runInBand` passes (TypeScript via `ts-jest`, TypeScript pinned to 6.x because `ts-jest` does not support 7), including the integration tests in `tests/integration/`. They run against the **dev/test Supabase project** configured in `.env` (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`), with the `schema` branch's migration applied there, in the §6 Gate 1 worktree. They never run against production.
 4. `npm run typecheck` (`tsc -p tsconfig.check.json`, covering `src/`, `api/` and `tests/`) passes with `strict: true`, and lint passes with zero errors.
 5. A fixture test maps a recorded Gmail `users.messages.get?format=full` response to a `messages` row that matches §5 field for field. It includes a nested `multipart/alternative` inside `multipart/mixed` and one attachment.
 6. Sync is tested for: first sync (no stored `historyId` → full sync, which stores at most 50 messages even when the inbox holds more), incremental sync (`history.list`), and fallback (`history.list` returns HTTP 404 → full sync). `GET /api/v1/messages` makes zero Gmail API calls (asserted with a fake `MailProvider` that fails on any call).
 7. Mark-as-read is idempotent: calling it twice on the same message returns `200` both times with `isRead: true`.
-8. Replying with `replyToMessageId` sets the `In-Reply-To` and `References` headers, derives the `Re:` subject per §4.3 (ignoring any client `subject`), and sends with the original `threadId` (asserted on the raw MIME and the Gmail request).
+8. Sending with `threadId` passes it unchanged to `messages.send`, and the raw MIME carries the client's subject and no derived threading headers (asserted on the Gmail request). A `threadId` Gmail doesn't know returns `MESSAGE_NOT_FOUND`.
 9. A Google `invalid_grant` on token refresh maps to `GMAIL_TOKEN_REVOKED` on every Gmail-backed endpoint, and clears the stored access token.
    Access-token persistence (§3.1) is tested:
    - a stored token more than 5 minutes from expiry is reused with no refresh call;
    - a token within 5 minutes of expiry is refreshed, and the new token and expiry are persisted;
    - writing an access token without an expiry is rejected by the DB.
 10. The webhook is tested for these cases:
-    - **Valid notification:** applies exactly the history delta since the stored `last_history_id`.
+    - **Valid notification:** returns `200` before any provider call, then applies exactly the history delta since the stored `history_id`, and saves the last `history.list` page's `historyId`.
     - **Duplicate or stale notification:** a notification whose `historyId` is ≤ the stored one makes no Gmail calls.
     - **Bad or missing `token` query parameter:** rejected with `401`.
     - **Unknown mailbox:** acknowledged without any Gmail call.
     - **Watch renewal cron (§4.6):**
       - a request without the correct `CRON_SECRET` bearer is rejected with `401` and makes no Gmail call;
-      - an authorized run calls `users.watch` once for every connected account and updates `watch_expiration`;
+      - an authorized run calls `users.watch` once for every connected account whose watch is missing, expired or within 24 h of expiry, skips the rest, and updates `watch_expiration`;
       - one account failing (including `invalid_grant`) does not stop the others.
 11. Tenant isolation is tested:
     - through every user-facing endpoint, user A cannot read or modify user B's `messages` or `users` rows;
@@ -68,7 +68,7 @@ The project is complete when **every** item below is true and verifiable.
 
 ### 3.1 Authentication
 
-- **No cookies.** Every user-facing endpoint (§4.1–§4.4) requires `Authorization: Bearer <Supabase access token>`. The frontend gets this token by running Supabase's Google sign-in itself, so the backend never sees the OAuth redirect or the PKCE code verifier.
+- **No cookies.** Every `/api/v1` endpoint except the Google OAuth callback requires `Authorization: Bearer <Supabase access token>`. That includes `GET /api/v1/auth/google/start` (§4.1). The frontend gets the token from its own Supabase sign-in. The callback is a browser redirect from Google and can't carry a header, so it authenticates with the signed `state` issued by the start endpoint (§4.1).
   - **Verification.** The token is checked locally with `jsonwebtoken`, using `jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'], audience: 'authenticated', issuer: SUPABASE_URL + '/auth/v1' })`.
     - The `algorithms` allow-list is mandatory. It blocks `alg: none` and algorithm-confusion attacks.
     - **Prerequisite:** the Supabase project must sign user tokens with the legacy shared secret (HS256). A project switched to asymmetric signing keys would make every request fail `UNAUTHENTICATED`.
@@ -86,9 +86,12 @@ The project is complete when **every** item below is true and verifiable.
     - `refresh_token` is written only when Google returns a new one.
   - **Paired columns.** `access_token` and `access_token_expires_at` are always written together, or both set to `null`. `google-auth-library` treats a credential with no `expiry_date` as *never expiring*, so an access token stored without an expiry would never be refreshed. A DB `CHECK` enforces the pairing (§5.2).
   - **Revocation.** On `invalid_grant`, both access-token columns are set to `null`.
-- Required Google scopes: `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/gmail.send`. The frontend starts sign-in with `signInWithOAuth({ provider: 'google', options: { scopes, queryParams: { access_type: 'offline', prompt: 'consent' } } })` so that Google returns a refresh token.
-- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` configure every `OAuth2Client`. `GOOGLE_REDIRECT_URI` must be registered on that Google OAuth client. The backend never performs an authorization-code exchange in v1, so the value is client configuration only.
-- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` must be the **same** OAuth client configured in the Supabase Google provider. Google only honours a refresh token for the client it was issued to.
+- **Gmail grant: backend OAuth.** The backend runs Google's authorization-code flow itself (§4.1): consent URL → `GET /api/v1/auth/google/callback` → code exchange. Supabase is used only for the user's own sign-in, not for Gmail tokens.
+- Required Google scopes: `openid`, `email`, `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/gmail.send`. The consent URL uses `access_type=offline` and `prompt=consent`, so that Google returns a refresh token. Google's token info returns the account's `email` and `sub` only when the `email` scope was granted.
+- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` configure every `OAuth2Client`.
+  - The client is always constructed with the options object, `new OAuth2Client({ clientId, clientSecret, redirectUri })`, because the positional-argument form is deprecated in `google-auth-library` 11.
+  - `GOOGLE_REDIRECT_URI` must be exactly `{origin}/api/v1/auth/google/callback`, and it must be registered as an authorized redirect URI on that Google OAuth client.
+- **Revocation detection.** A refresh rejected for a revoked or invalid refresh token surfaces as a `GaxiosError` with `response.data.error === 'invalid_grant'`. That check is the only trigger for `GMAIL_TOKEN_REVOKED`.
 
 ### 3.2 Format
 
@@ -129,14 +132,14 @@ interface ErrorResponse {
 
 | Code | HTTP | `retryable` | Meaning |
 |---|---|---|---|
-| `UNAUTHENTICATED` | 401 | false | No valid Supabase session, or the OAuth code exchange failed. |
+| `UNAUTHENTICATED` | 401 | false | Missing or invalid bearer token, or an invalid OAuth `state` (§4.1b). |
 | `GMAIL_NOT_CONNECTED` | 409 | false | The user has no `users` row, no refresh token, or is missing the required scopes. |
 | `GMAIL_TOKEN_REVOKED` | 401 | false | Google rejected the refresh token (`invalid_grant`). The user must sign in again. |
 | `VALIDATION_FAILED` | 400 | false | The request params or body failed validation. |
 | `MESSAGE_NOT_FOUND` | 404 | false | The message ID is not in this user's mailbox (DB or Gmail). |
 | `GMAIL_RATE_LIMITED` | 429 | true | Gmail returned 429 or a 403 `rateLimitExceeded`/`userRateLimitExceeded`. Sets the `Retry-After` header (seconds). |
 | `GMAIL_UPSTREAM_ERROR` | 502 | true | Gmail returned 5xx or an unexpected 4xx. |
-| `SYNC_FAILED` | 502 | true | A sync (§3.5) run by the webhook failed for a reason other than auth or rate limit. |
+| `SYNC_FAILED` | 502 | true | Reserved. Webhook syncs run after the ack (§4.5), so their failures are logged, not returned. |
 | `INTERNAL` | 500 | false | Unhandled server or DB error. |
 
 ### 3.4 `MessageDTO`
@@ -157,20 +160,21 @@ interface MessageDTO {
   threadId: string;
   labelIds: string[];
   isRead: boolean;
+  isStarred: boolean;
   snippet: string;
   historyId: string;
   internalDate: string;          // ISO-8601
   sizeEstimate: number;
   subject: string | null;
   fromAddress: string;
-  toAddresses: string[];
+  toAddress: string[];
   ccAddresses: string[];
   bccAddresses: string[];
   rfc822MessageId: string | null;
   inReplyTo: string | null;
   references: string | null;
   dateHeader: string | null;
-  bodyText: string | null;
+  bodyPlain: string | null;
   bodyHtml: string | null;
   attachments: AttachmentMeta[];
   syncedAt: string;              // ISO-8601
@@ -179,16 +183,21 @@ interface MessageDTO {
 
 ### 3.5 Sync procedure
 
-The procedure is shared by the connect endpoint (§4.1) and the webhook (§4.5); no other code path reads mail from Gmail. Its DB writes are committed by the `apply_sync_batch` function (§5.5), which runs under `pg_advisory_xact_lock(hashtext(user_id::text))`; `last_history_id` only ever advances (§4.5, step 5).
+The procedure is shared by the connect endpoint (§4.1) and the webhook (§4.5); no other code path reads mail from Gmail. It runs under `pg_advisory_xact_lock(hashtext(user_id::text))`, and `history_id` only ever advances (§4.5, step 5).
 
-- **Full sync** (when `last_history_id` is `null`, or on the 404 fallback): `users.messages.list({ labelIds: ['INBOX'], maxResults: 50 })`, a single page with no further paging, so at most the 50 most recent INBOX messages. Then `users.messages.get({ format: 'full' })` each one, upsert it, and set `last_history_id` from the newest message.
-- **Incremental sync** (otherwise): `users.history.list({ startHistoryId: last_history_id, historyTypes: ['messageAdded','messageDeleted','labelAdded','labelRemoved'] })`, paging until done.
+- **Full sync** (when `history_id` is `null`, or on the 404 fallback): `users.messages.list({ labelIds: ['INBOX'], maxResults: 50 })`, paging with `pageToken` until 50 IDs are collected or the inbox is exhausted, so at most the 50 most recent INBOX messages. Then `users.messages.get({ format: 'full' })` each one and upsert it on `(user_id, gmail_id)`. A `get` that returns 404 is skipped. Finally, set `users.history_id` from the `historyId` of the newest fetched message, because `messages.list` responses carry no `historyId`.
+- **Incremental sync** (otherwise): `users.history.list({ startHistoryId: history_id, historyTypes: ['messageAdded','messageDeleted','labelAdded','labelRemoved'] })`, paging until done.
+  - History records carry only message `id`s (and `threadId`), so every change is applied as follows:
   - `messagesAdded` → `get` + upsert.
-  - `messagesDeleted` → delete the row.
-  - `labelsAdded` / `labelsRemoved` → update `label_ids` and `is_read`.
-  - Afterwards, set `last_history_id` to the response's `historyId`.
-- **404 fallback.** If `history.list` returns **404** (the start ID is outside the retained history window), fall back to a full sync.
-- Both kinds set `public.users.last_synced_at = now()`.
+    - If `get` returns **404** (the message was deleted before the sync reached it), skip it and delete any stored row for that `gmail_id`. This is not an error.
+  - `messagesDeleted` → delete the row (a no-op if there is none).
+  - `labelsAdded` / `labelsRemoved` carry only the label IDs that changed, not the message's full label set:
+    - **If the row exists:** apply the change to the stored `label_ids` (set union for added, set difference for removed), then recompute `is_read` and `is_starred`.
+    - **If the row does not exist** (e.g. an older message beyond the initial 50 was moved into `INBOX`): `get` the message and upsert it, so its full, current label set is stored. A 404 there is skipped as above.
+  - Records are applied in the order returned, so a later record wins.
+  - Afterwards, set `history_id` to the response's `historyId`.
+- **404 fallback.** If `history.list` returns **404** (the start ID is outside the retained history window), fall back to a full sync. Through the provider abstraction this surfaces as `ProviderError` with `kind: 'cursor_expired'` (`src/providers/provider.ts`).
+- Both kinds set `users.last_synced_at = now()`.
 
 ### 3.6 Environment variables
 
@@ -210,61 +219,63 @@ A missing required variable fails the function with `500 INTERNAL` and a log lin
 
 ## 4. Endpoint contracts
 
-### 4.1 Connect Gmail — `POST /api/v1/auth/google/callback`
+### 4.1 Connect Gmail — backend OAuth flow
 
-The frontend calls this once, right after its own Supabase Google sign-in completes, to hand the backend the Google refresh token. Supabase returns that token to the frontend once, as `session.provider_refresh_token`, and does not store it. The endpoint answers with JSON and never redirects.
+Two endpoints:
+- **Start** (`GET /api/v1/auth/google/start`): the frontend `fetch`es it with the bearer, then sends the browser to the returned URL.
+- **Callback** (`GET /api/v1/auth/google/callback`): Google redirects the browser there, and it redirects back to the frontend.
 
-**Request** — `Authorization: Bearer <Supabase access token>` (§3.1), `Content-Type: application/json`
+#### 4.1a Start — `GET /api/v1/auth/google/start`
 
-```ts
-interface ConnectGmailRequest {
-  providerRefreshToken: string;   // session.provider_refresh_token from the frontend's sign-in
-}
-```
+**Request:** `Authorization: Bearer <Supabase access token>` (§3.1). No body or query.
 
-**Behavior**
+**Behavior:** issue a signed `state`, then build the consent URL with `buildAuthorizationUrl` (scopes from §3.1, `access_type=offline`, `prompt=consent`, `login_hint = claims.email`).
 
-1. Authenticate the bearer (§3.1) → `user_id = claims.sub`, `email = claims.email`.
-2. Validate the body. A missing or empty `providerRefreshToken` → `VALIDATION_FAILED`.
-3. **Prove the refresh token.** Build an `OAuth2Client` with our `GOOGLE_CLIENT_ID`/`SECRET` and the given refresh token, and call `refreshAccessToken()`.
-   - `invalid_grant` (the token is wrong, revoked, or issued to another client) → `GMAIL_TOKEN_REVOKED`.
-4. **Check it belongs to this user.** Call token info on the new access token. If the token-info `email` is not equal to `claims.email` (case-insensitive), → `VALIDATION_FAILED` with `details: { reason: 'EMAIL_MISMATCH' }`. This stops a user from attaching someone else's mailbox.
-5. **Check scopes.** If either required scope from §3.1 is missing from token info → `GMAIL_NOT_CONNECTED`.
-6. Upsert `users` with:
-   - `user_id`;
-   - `email`;
-   - `refresh_token` (the refreshed credentials' `refresh_token` if Google rotated it, else the given one);
-   - `scopes`;
-   - `access_token` and `access_token_expires_at` (from the refreshed credentials' `expiry_date`), written as a pair (§3.1).
-
-   On re-connect, reset `last_history_id` to `null` (this forces a full sync).
-7. Call `MailProvider.watch()` (§4.5). If it fails, log the failure; it does not fail the request, and `watchExpiration` is `null`.
-8. Run the initial **full sync** (§3.5). If it fails, log the failure; it does not fail the request, and `initialSync` is `'failed'`. `last_history_id` then stays `null`, so the next push notification runs the full sync instead.
-
-The endpoint is idempotent: calling it again with a valid token for the same user overwrites the row.
+**State format:** `base64url(JSON.stringify({ sub, email, exp, nonce }))` + `.` + `base64url(HMAC-SHA256(JWT_SECRET, payload))`, where:
+- `sub` and `email` come from the bearer's claims;
+- `exp` is now + 10 minutes (epoch seconds);
+- `nonce` is 16 random bytes.
 
 **Response — `200 OK`**
 
 ```ts
-interface ConnectGmailResponse {
-  email: string;
-  scopes: string[];
-  watchExpiration: string | null;   // ISO-8601; null if watch() failed
-  initialSync: 'completed' | 'failed';
+interface StartGmailConnectResponse {
+  authorizationUrl: string;  // https://accounts.google.com/o/oauth2/v2/auth?...&state=...
+  expiresAt: string;         // ISO-8601; when the state stops being accepted
 }
 ```
 
-**Errors**
+**Errors:** `UNAUTHENTICATED` (401), `INTERNAL` (500).
 
-| Code | HTTP | Trigger |
-|---|---|---|
-| `UNAUTHENTICATED` | 401 | Missing or invalid bearer token. |
-| `VALIDATION_FAILED` | 400 | Body not JSON, `providerRefreshToken` missing or empty, or `EMAIL_MISMATCH` (step 4). |
-| `GMAIL_TOKEN_REVOKED` | 401 | Google rejected the refresh token (`invalid_grant`). |
-| `GMAIL_NOT_CONNECTED` | 409 | A required Gmail scope was not granted. |
-| `GMAIL_RATE_LIMITED` | 429 | Google rate limit during refresh or token info. |
-| `GMAIL_UPSTREAM_ERROR` | 502 | Google 5xx or an unexpected 4xx. |
-| `INTERNAL` | 500 | DB upsert failed or an unexpected exception was thrown. |
+#### 4.1b Callback — `GET /api/v1/auth/google/callback?code&state` (or `?error&state`)
+
+No bearer: the signed `state` identifies the user. Every outcome is a **`302`** to the frontend:
+
+| Outcome | `Location` |
+|---|---|
+| Connected | `{FRONTEND_URL}/settings/gmail?status=connected&initialSync=completed\|failed` |
+| Any error | `{FRONTEND_URL}/settings/gmail?status=error&code=<ErrorCode>[&reason=<details.reason>]` |
+
+**Behavior**
+
+1. **Verify `state`.**
+   - The HMAC is checked in constant time and `exp` must be in the future.
+   - A missing, tampered or expired state → `UNAUTHENTICATED`.
+   - This yields `user_id = sub` and `expectedEmail = email`.
+2. **Handle denial.** If Google sent `error` (e.g. `access_denied`) instead of `code` → `GMAIL_NOT_CONNECTED` with `reason=<Google error>`. A missing `code` → `VALIDATION_FAILED`.
+3. **Exchange the code** with `exchangeAuthorizationCode` (`OAuth2Client.getToken`), then call token info.
+   - `invalid_grant` (expired or reused code) → `GMAIL_TOKEN_REVOKED`.
+   - No refresh token returned → `GMAIL_NOT_CONNECTED`.
+4. **Check identity.** Token info must have `email` and `sub`; otherwise → `GMAIL_NOT_CONNECTED` with `reason=missing_email_scope`. The email must equal `expectedEmail` (case-insensitive); otherwise → `VALIDATION_FAILED` with `reason=EMAIL_MISMATCH`.
+   - This is the CSRF defence: a victim tricked into completing a flow started with an attacker's `state` authorizes the victim's own Google account, whose email doesn't match the attacker's.
+5. **Check scopes.** If `gmail.modify` or `gmail.send` is missing → `GMAIL_NOT_CONNECTED` with `reason=missing_gmail_scope`.
+6. **Upsert** `users` on conflict `google_id` (linking rules in §5.2) with `google_id` (token-info `sub`), `user_id`, `email`, `refresh_token`, `scopes`, and `access_token` / `access_token_expires_at` as a pair (§3.1). Reset `history_id` to `null` on re-connect (this forces a full sync). Linking conflicts → `VALIDATION_FAILED` with `reason=GOOGLE_ACCOUNT_LINKED_ELSEWHERE` or `ANOTHER_GOOGLE_ACCOUNT_LINKED`.
+7. Call `MailProvider.watch()` (§4.5). If it fails, the failure is logged; it doesn't fail the connect.
+8. Run the initial **full sync** (§3.5). If it fails, the failure is logged and `initialSync=failed`. `history_id` then stays `null`, so the next push notification runs the full sync instead.
+
+**Error codes** (in the redirect's `code` parameter): `UNAUTHENTICATED`, `VALIDATION_FAILED`, `GMAIL_TOKEN_REVOKED`, `GMAIL_NOT_CONNECTED`, `GMAIL_RATE_LIMITED`, `GMAIL_UPSTREAM_ERROR`, `INTERNAL`.
+
+If `FRONTEND_URL` itself is not configured, the callback answers `500` with the §3.3 envelope instead of redirecting.
 
 ---
 
@@ -295,7 +306,7 @@ interface ListMessagesQuery {
 interface ListMessagesResponse {
   messages: MessageDTO[];      // length <= limit
   nextCursor: string | null;   // null when there are no more rows
-  lastSyncedAt: string | null; // ISO-8601, public.users.last_synced_at; null if no sync has completed yet
+  lastSyncedAt: string | null; // ISO-8601, users.last_synced_at; null if no sync has completed yet
 }
 ```
 
@@ -312,47 +323,38 @@ interface ListMessagesResponse {
 
 ### 4.3 Message send — `POST /api/v1/messages/send`
 
-Sends a new message or a reply through Gmail, then stores the sent message.
+Sends a plain-text message through Gmail, optionally into an existing thread, then stores the sent message. Implemented in `src/send/index.ts`.
 
 **Request** — `Content-Type: application/json`
 
 ```ts
 interface SendMessageRequest {
-  to: string[];               // >= 1 address
-  cc?: string[];
-  bcc?: string[];
-  subject?: string;           // required for new messages (may be ""); max 998 chars, no CR/LF.
-                              // ignored when replyToMessageId is set; the server derives it (Behavior §2)
-  text?: string;              // at least one of text / html is required
-  html?: string;
-  replyToMessageId?: string;  // gmailId of a message already stored for this user
+  to: string | string[];  // one address or a list; >= 1, <= 100
+  subject: string;        // may be ""; max 998 chars, no CR/LF
+  body: string;           // plain text (text/plain; charset=UTF-8)
+  threadId?: string;      // a Gmail thread ID in this user's mailbox, passed to Gmail as-is
 }
 ```
 
-Validation rules:
+Validation rules (`VALIDATION_FAILED` with `details.issues` listing every failure):
 
-- Every address is a valid RFC 5322 addr-spec, or `Name <addr-spec>`.
-- Total recipients across `to`, `cc`, and `bcc` is ≤ 100.
-- `subject` is required when `replyToMessageId` is absent.
-- No header field (subject or addresses) may contain CR or LF characters, which prevents header injection.
+- Every address is a valid RFC 5322 addr-spec, or `Name <addr-spec>`, with no CR/LF.
+- `subject` contains no CR or LF (header injection) and is at most 998 characters.
+- `body` is a string. An empty body is allowed.
+- `threadId`, when present, is a non-empty string of letters and digits.
 
 **Behavior**
 
-1. Authenticate, then load `users`.
-2. If `replyToMessageId` is set, load that row (it must belong to the user) and set:
-   - `In-Reply-To: <original rfc822_message_id>`
-   - `References: <original references> <original rfc822_message_id>`
-   - The subject is derived by the server, and any client-supplied `subject` is ignored. Gmail threads a reply only when the `Subject` matches the original.
-     - If the original `subject` already starts with `Re:` (case-insensitive, after trimming), it is reused verbatim.
-     - Otherwise it becomes `Re: <original subject>`.
-     - A null original subject gives `Re:`.
-   - `threadId = original thread_id`
-3. Build an RFC 2822 MIME message:
-   - If both bodies are present: `multipart/alternative` with `text/plain` and `text/html` parts.
-   - Otherwise: a single part.
-   - Encoding: UTF-8, with RFC 2047-encoded subject.
-4. Call `users.messages.send({ userId: 'me', requestBody: { raw: base64url(mime), threadId? } })`.
-5. Call `users.messages.get({ id: sent.id, format: 'full' })` and upsert the row.
+1. Authenticate (§3.1), then load the user's credentials and account email from `users`.
+2. Build an RFC 2822 message (`src/providers/gmail/mime.ts`, behind `MailProvider.sendMessage`):
+   - Headers: `From: <users.email>`, `To`, `Subject`, `Date`, `MIME-Version: 1.0`.
+   - The subject is RFC 2047-encoded when it isn't ASCII.
+   - The body is a single `text/plain; charset=UTF-8` part, base64 content-transfer-encoded.
+   - Lines end in CRLF.
+3. Call `users.messages.send({ userId: 'me', requestBody: { raw: base64url(mime), threadId? } })`.
+   - `threadId` is passed through unchanged. No `In-Reply-To` / `References` headers are derived and the subject is not rewritten.
+   - Gmail itself files the message in that thread, but recipients' mail clients may not thread it unless the subject matches.
+4. `messages.send` returns only `id`, `threadId` and `labelIds`. So call `users.messages.get({ id, format: 'full' })`, normalize it with the same parser as sync (§5.1), and upsert the row on `(user_id, gmail_id)`.
 
 **Response — `201 Created`**
 
@@ -366,11 +368,11 @@ interface SendMessageResponse {
 
 | Code | HTTP | Trigger |
 |---|---|---|
-| `UNAUTHENTICATED` | 401 | No valid session. |
+| `UNAUTHENTICATED` | 401 | Missing or invalid bearer token. |
 | `GMAIL_NOT_CONNECTED` | 409 | No `users` row or refresh token. |
 | `GMAIL_TOKEN_REVOKED` | 401 | `invalid_grant`. |
 | `VALIDATION_FAILED` | 400 | Body is not JSON, or it fails any rule above (`details.issues` lists them). |
-| `MESSAGE_NOT_FOUND` | 404 | `replyToMessageId` is not in this user's `messages` rows. |
+| `MESSAGE_NOT_FOUND` | 404 | Gmail rejected `threadId` as not found in this mailbox (`details: { threadId }`). |
 | `GMAIL_RATE_LIMITED` | 429 | Gmail rate limit. |
 | `GMAIL_UPSTREAM_ERROR` | 502 | Gmail send/get returned 5xx or an unexpected 4xx. |
 | `INTERNAL` | 500 | DB error or an unexpected exception. |
@@ -440,7 +442,7 @@ Receives Gmail change notifications from a Cloud Pub/Sub **push** subscription a
 
 **Watch registration and renewal**
 
-- `MailProvider.watch()` calls `users.watch({ topicName: GOOGLE_PUBSUB_TOPIC, labelIds: ['INBOX'], labelFilterBehavior: 'INCLUDE' })`. It stores the response's `expiration` in `public.users.watch_expiration`.
+- `MailProvider.watch()` calls `users.watch({ topicName: GOOGLE_PUBSUB_TOPIC, labelIds: ['INBOX'], labelFilterBehavior: 'INCLUDE' })`. It stores the response's `expiration` in `users.watch_expiration`.
 - It is called:
   - at the end of a successful OAuth callback (§4.1), so a new account receives push immediately;
   - once a day for every connected account, by the cron job in §4.6.
@@ -468,56 +470,61 @@ interface PubSubPushBody {
    - Compare the `token` query parameter to it in constant time (`crypto.timingSafeEqual` on equal-length buffers). If it is missing or doesn't match → `UNAUTHENTICATED`.
    - There is no bypass. A local replay simply sends the same `?token=` from `.env`.
    - Known limit: the token sits in the URL, so it can appear in access logs. Rotate it by updating the env var and the subscription endpoint together.
-2. Decode `message.data` into `{ emailAddress, historyId }`. If it fails → `VALIDATION_FAILED`.
-3. Look up `users` by `email = emailAddress`. If there is no row, or no refresh token → **ack** (`204`) and make no Gmail call.
-4. **Delta rule:**
-   - If `historyId` ≤ `last_history_id` (compared as unsigned 64-bit integers via `BigInt`), the notification is a duplicate or arrived out of order → ack, no Gmail call.
-   - If the stored `last_history_id` is `null` (the initial sync at connect failed), run a full sync (§3.5).
-   - Otherwise run the incremental sync (§3.5) starting from the **stored** `last_history_id`, never from the notification's `historyId`. The notification's ID is the mailbox's *new* state and is used only as the "is there anything newer?" test.
+2. Decode `message.data` (base64 JSON) into `{ emailAddress, historyId }`. If it fails → `VALIDATION_FAILED`.
+3. **Ack immediately.** Return `200` with an empty body, and hand steps 4–6 to `waitUntil` from `@vercel/functions`. That keeps the function alive after the response, up to the function's `maxDuration`. Everything after the ack is background work:
+   - **Failures are logged and never retried by Pub/Sub**, because it has already been acked.
+   - Nothing is lost: the next notification catches up, because every sync starts from the **stored** `history_id`.
+   - Outside Vercel (tests, `vercel dev`), `waitUntil` is a no-op and the promise simply runs to completion.
+4. Look up `users` by `email = emailAddress` (`findAccountByEmailUnscoped`). If there is no row, or no refresh token, stop with no Gmail call.
+5. **Delta rule:**
+   - If `historyId` ≤ `history_id` (compared as unsigned 64-bit integers via `BigInt`), the notification is a duplicate or arrived out of order → stop, no Gmail call.
+   - If the stored `history_id` is `null` (the initial sync at connect failed), run a full sync (§3.5).
+   - Otherwise run the incremental sync (§3.5) starting from the **stored** `history_id`, never from the notification's `historyId`. The notification's ID is the mailbox's *new* state and is used only as the "is there anything newer?" test.
    - The 404 fallback to full sync applies here too.
-5. `last_history_id` only ever advances: `UPDATE … SET last_history_id = $new WHERE last_history_id IS NULL OR last_history_id::numeric < $new::numeric`. This makes concurrent syncs (webhook and list) safe. Each sync commits through `apply_sync_batch` (§5.5), which holds `pg_advisory_xact_lock(hashtext(user_id::text))` and applies this rule; `advance_last_history_id` (§5.5) applies it alone.
+   - The saved `history_id` is the `historyId` of the **last `history.list` page**, saved only after every change was applied, never the notification's.
+6. `history_id` only ever advances: `UPDATE … SET history_id = $new WHERE history_id IS NULL OR history_id::numeric < $new::numeric`. This makes concurrent syncs (webhook and list) safe. Each sync runs under `pg_advisory_xact_lock(hashtext(user_id::text))`.
 
 **Response**
 
 | Outcome | Status | Body |
 |---|---|---|
-| Processed, duplicate, or unknown mailbox | `204 No Content` | none (acks the message) |
+| Valid token and body (acked; sync runs in the background) | `200 OK` | empty |
 | Error | per table below | §3.3 envelope |
 
-Pub/Sub redelivers on any non-2xx status, so only retryable failures return non-2xx.
+Only failures detected **before** the ack return non-2xx. Pub/Sub retries those, and they usually need a configuration fix.
 
-**Errors**
+**Errors** (before the ack only)
 
 | Code | HTTP | Trigger |
 |---|---|---|
 | `UNAUTHENTICATED` | 401 | Missing or wrong `token` query parameter. |
 | `VALIDATION_FAILED` | 400 | Body not JSON, or `message.data` does not decode to `{ emailAddress, historyId }`. |
-| `GMAIL_RATE_LIMITED` | 429 | Gmail rate limit during sync. Pub/Sub retries with backoff. |
-| `SYNC_FAILED` | 502 | Any other Gmail failure during sync. |
-| `INTERNAL` | 500 | DB error or an unexpected exception. |
+| `INTERNAL` | 500 | `GOOGLE_PUBSUB_VERIFICATION_TOKEN` not configured. |
 
-A `GMAIL_TOKEN_REVOKED` during a webhook sync is **acked** (`204`): retrying cannot succeed. The account's `refresh_token`, `access_token` and `access_token_expires_at` are then set to `null`, so later user requests return `GMAIL_NOT_CONNECTED`.
+**Background failures**, logged and not returned:
+- **Rate limits, Gmail errors and DB errors:** the sync stops without saving `history_id`, so the next notification retries the same delta.
+- **`invalid_grant`:** the account's `refresh_token`, `access_token` and `access_token_expires_at` are set to `null`, so later user requests return `GMAIL_NOT_CONNECTED`.
 
 ---
 
-### 4.6 Watch-renewal cron job — `GET /api/cron/renew-watches`
+### 4.6 Watch-renewal cron job — `GET /api/cron/renew-watch`
 
-A Vercel Cron Job that renews the Gmail push watch (§4.5) for every connected account once a day. Only Vercel's scheduler calls this endpoint; it is not user-facing.
+A Vercel Cron Job, run once a day, that renews the Gmail push watch (§4.5) for every connected account whose watch is missing, expired, or expires within 24 hours. Only Vercel's scheduler calls this endpoint; it is not user-facing.
 
 **Configuration**
 
-- Function file: `api/cron/renew-watches.ts`, with its logic in `src/cron`.
+- Function file: `api/cron/renew-watch.ts`, with its logic in `src/cron/renewWatch.ts`.
 - `vercel.json`:
 
   ```json
   {
-    "crons": [{ "path": "/api/cron/renew-watches", "schedule": "0 6 * * *" }],
-    "functions": { "api/cron/renew-watches.ts": { "maxDuration": 300 } }
+    "crons": [{ "path": "/api/cron/renew-watch", "schedule": "0 6 * * *" }],
+    "functions": { "api/cron/renew-watch.ts": { "maxDuration": 300 } }
   }
   ```
 
 - Env: `CRON_SECRET`, a random string of at least 32 characters. Vercel sends it as `Authorization: Bearer <CRON_SECRET>` on every cron invocation.
-- Vercel runs cron jobs against production deployments only. On a preview or locally, trigger the job by hand with `vercel crons run /api/cron/renew-watches`, or by sending the bearer header yourself.
+- Vercel runs cron jobs against production deployments only. On a preview or locally, trigger the job by hand with `vercel crons run /api/cron/renew-watch`, or by sending the bearer header yourself.
 
 **Request**
 
@@ -526,10 +533,11 @@ The request has no body and no query parameters. The only header that matters is
 **Behavior**
 
 1. **Authenticate.** If `CRON_SECRET` is unset or empty → `500 INTERNAL` (fail closed: the job never runs unauthenticated). If the header is missing or doesn't match (constant-time comparison) → `UNAUTHENTICATED`.
-2. **Select accounts.** Using the service-role key (§5.2), select every `users` row with a non-null `refresh_token`.
-3. **Renew.** For each account, call `MailProvider.watch()` and store the new `watch_expiration`. Calls run with a concurrency limit of 5. Failures are per account, never fatal for the run:
+2. **Select accounts.** Using `listConnectedAccountsUnscoped({ watchExpiringBefore: now + 24 h })` (§5.3), select every `users` row with a non-null `refresh_token` where `watch_expiration` is null or earlier than `now + 24 h`. That covers watches that are expiring soon, already expired after a missed run, or never registered because `watch()` failed at connect.
+3. **Renew.** For each account, call `MailProvider.watch()` (`users.watch` on `GOOGLE_PUBSUB_TOPIC`) and store the new `watch_expiration`. Gmail returns no resource ID, so none is stored. Calls run with a concurrency limit of 5. Failures are per account, never fatal for the run:
    - `invalid_grant`: clear `refresh_token`, `access_token` and `access_token_expires_at`, as in §4.5, and count the account as `revoked`.
-   - Rate limit or other Gmail error: log it, count the account as `failed`, and leave the existing `watch_expiration` unchanged. The next daily run retries; Gmail's 7-day window allows six missed runs.
+   - Stored tokens that cannot be decrypted (§5.4): treated like `invalid_grant`.
+   - Rate limit or other Gmail error: log it, count the account as `failed`, and leave the existing `watch_expiration` unchanged. The next daily run retries it. Because only watches with less than 24 h left are renewed, a single missed run can let a watch lapse. Push then stops until the next run renews it, and sync catches up from the stored `history_id` (§3.5).
 4. **Respond** with the counts.
 
 **Response — `200 OK`** (also returned when some accounts failed)
@@ -566,20 +574,21 @@ Source is the Gmail `users.messages.get` response with `format=full` (the `Messa
 | `thread_id` | `text` | `string` | no | `m.threadId` |
 | `label_ids` | `text[]` | `string[]` | no (default `{}`) | `m.labelIds` (absent → `[]`) |
 | `is_read` | `boolean` | `boolean` | no | Derived: `!m.labelIds.includes('UNREAD')` |
+| `is_starred` | `boolean` | `boolean` | no | Derived: `m.labelIds.includes('STARRED')` |
 | `snippet` | `text` | `string` | no (default `''`) | `m.snippet` |
 | `history_id` | `text` | `string` | no | `m.historyId` (uint64, stored as text to avoid precision loss) |
 | `internal_date` | `timestamptz` | `string` (ISO) | no | `m.internalDate` (epoch-ms string → `new Date(Number(v))`) |
 | `size_estimate` | `integer` | `number` | no | `m.sizeEstimate` |
 | `subject` | `text` | `string \| null` | yes | `m.payload.headers[name="Subject"].value` |
 | `from_address` | `text` | `string` | no (default `''`) | `m.payload.headers[name="From"].value` (raw, e.g. `Ada <ada@x.io>`) |
-| `to_addresses` | `text[]` | `string[]` | no (default `{}`) | `m.payload.headers[name="To"].value`, split into addresses |
+| `to_address` | `text[]` | `string[]` | no (default `{}`) | `m.payload.headers[name="To"].value`, split into addresses. Named singular, but an array, because a message can have several recipients |
 | `cc_addresses` | `text[]` | `string[]` | no (default `{}`) | `m.payload.headers[name="Cc"].value`, split |
 | `bcc_addresses` | `text[]` | `string[]` | no (default `{}`) | `m.payload.headers[name="Bcc"].value`, split (present on sent mail only) |
 | `rfc822_message_id` | `text` | `string \| null` | yes | `m.payload.headers[name="Message-ID"].value` |
 | `in_reply_to` | `text` | `string \| null` | yes | `m.payload.headers[name="In-Reply-To"].value` |
 | `references` | `text` | `string \| null` | yes | `m.payload.headers[name="References"].value` |
 | `date_header` | `text` | `string \| null` | yes | `m.payload.headers[name="Date"].value` (raw, unparsed) |
-| `body_text` | `text` | `string \| null` | yes | First part (depth-first) with `mimeType = "text/plain"` and no `filename`: `body.data`, base64url-decoded as UTF-8 |
+| `body_plain` | `text` | `string \| null` | yes | First part (depth-first) with `mimeType = "text/plain"` and no `filename`: `body.data`, base64url-decoded as UTF-8. A single-part message (no `payload.parts`) uses `payload.body.data`, by `payload.mimeType` |
 | `body_html` | `text` | `string \| null` | yes | First part (depth-first) with `mimeType = "text/html"` and no `filename`: `body.data`, base64url-decoded as UTF-8 |
 | `attachments` | `jsonb` | `AttachmentMeta[]` | no (default `[]`) | Every part with a non-empty `filename` and `body.attachmentId`: `{ partId: part.partId, filename: part.filename, mimeType: part.mimeType, size: part.body.size, attachmentId: part.body.attachmentId }` |
 | `synced_at` | `timestamptz` | `string` | no | Server time of the last write from Gmail |
@@ -597,43 +606,42 @@ Constraints and indexes:
 - `INDEX (user_id, internal_date DESC, gmail_id DESC)`, used for list pagination.
 - RLS enabled with **no policies**. That denies all access through the anon and authenticated roles: the Data API is closed to clients, and only the service role, which bypasses RLS, can read or write. This is defence in depth; isolation itself is §5.3.
 
-### 5.2 `users` — connected Gmail account per user
-
-`public.users` holds one row per Supabase Auth user who has connected Gmail: OAuth state, sync state and watch metadata. It is distinct from Supabase's `auth.users` (which it references) and from the Gmail API's `users.*` methods. Where a column is referenced elsewhere in this document it is written `public.users.<column>`.
+### 5.2 `users` — one connected Google account per user
 
 | Column | Postgres type | Nullable | Source |
 |---|---|---|---|
-| `user_id` | `uuid` PK, FK → `auth.users(id)` on delete cascade | no | Session |
-| `email` | `text`, stored lowercased | no | `claims.email` of the bearer token (§4.1), lowercased before every write and lookup |
-| `refresh_token` | `text`: ciphertext (§5.4) | yes | `providerRefreshToken` from the §4.1 request body (or Google's rotated one); `null` after revocation (§4.5, §4.6) |
+| `google_id` | `text` PK | no | Token-info `sub` of the connected Google account (§4.1). This is the upsert conflict target |
+| `user_id` | `uuid` `UNIQUE`, FK → `auth.users(id)` on delete cascade | no | `sub` claim of the verified bearer token (§3.1) |
+| `email` | `text` `UNIQUE` | no | `claims.email` of the bearer token (§4.1) |
+| `refresh_token` | `text`: ciphertext (§5.4) | yes | `refresh_token` from the §4.1b code exchange (or Google's rotated one later); `null` after revocation (§4.5, §4.6) |
 | `scopes` | `text[]` | no | Granted scopes from token info |
-| `access_token` | `text`: ciphertext (§5.4) | yes | §4.1: the `access_token` from its proving refresh. Afterwards: `tokens.access_token` from the `'tokens'` event |
-| `access_token_expires_at` | `timestamptz` | yes | §4.1: that refresh's `expiry_date`. Afterwards: `tokens.expiry_date` (epoch ms) from the `'tokens'` event |
-| `last_history_id` | `text`, digits only | yes | Max `historyId` after the last successful sync; `null` forces a full sync |
+| `access_token` | `text`: ciphertext (§5.4) | yes | §4.1b: the code exchange's `access_token`. Afterwards: `tokens.access_token` from the `'tokens'` event |
+| `access_token_expires_at` | `timestamptz` | yes | §4.1b: the code exchange's `expiry_date`. Afterwards: `tokens.expiry_date` (epoch ms) from the `'tokens'` event |
+| `history_id` | `text` | yes | Max `historyId` after the last successful sync; `null` forces a full sync |
 | `last_synced_at` | `timestamptz` | yes | Server time |
-| `watch_expiration` | `timestamptz` | yes | `users.watch` response `expiration` (epoch-ms string); `null` means no active watch |
-| `created_at` / `updated_at` | `timestamptz` default `now()` | no | Server time (`updated_at` by trigger on update, as for `messages`) |
+| `watch_expiration` | `timestamptz` | yes | `users.watch` response `expiration` (epoch-ms string); `null` means no active watch. Gmail's watch returns no resource ID, so none is stored |
+| `created_at` / `updated_at` | `timestamptz` | no | Server time |
 
 RLS is the same as `messages` (enabled, no policies). Neither `refresh_token` nor `access_token` is ever returned by any endpoint.
 
-Constraints:
+`CHECK ((access_token IS NULL) = (access_token_expires_at IS NULL))` enforces the pairing rule from §3.1.
 
-- `CHECK ((access_token IS NULL) = (access_token_expires_at IS NULL))` enforces the pairing rule from §3.1.
-- `CHECK (email = lower(email))`: the server lowercases every email before writing it or looking it up (the webhook's `emailAddress` included), so the lookup and `UNIQUE (email)` are effectively case-insensitive.
-- `CHECK (last_history_id ~ '^[0-9]+$')` (when not null), so the `::numeric` comparisons in §4.5 and §5.5 cannot fail.
-
-`UNIQUE (email)` exists so the webhook can look accounts up by email. The webhook and the cron job look accounts up without a user (by email, or all of them). These are the only queries allowed to omit the `user_id` filter (§5.3).
+**Linking rules.** The table is keyed by `google_id`, and every user-scoped query still filters on `user_id` (§5.3).
+- **Connect upsert.** `INSERT … ON CONFLICT (google_id) DO UPDATE SET … WHERE users.user_id = EXCLUDED.user_id`.
+  - If it affects zero rows, the Google account is already linked to a different VibeMail user → `VALIDATION_FAILED` with `details: { reason: 'GOOGLE_ACCOUNT_LINKED_ELSEWHERE' }`.
+  - If the insert violates `UNIQUE (user_id)`, this user already has a different Google account connected → `VALIDATION_FAILED` with `details: { reason: 'ANOTHER_GOOGLE_ACCOUNT_LINKED' }`. Multiple or switched accounts are out of scope (§1).
+- **Lookups by email.** `UNIQUE (email)` lets the webhook find accounts by email. The webhook and the cron job look accounts up without a user (by email, or all of them). These are the only queries allowed to omit the `user_id` filter (§5.3).
 
 ### 5.3 Tenant isolation
 
 Every query runs as the service role, so RLS does not protect user data. The rules below do.
 
 - All SQL lives in the repository layer (`src/db`). Function code never builds queries.
-- Every repository function that touches `messages` or `users` on behalf of a user takes `userId: string` as a required parameter, and puts `user_id = $userId` in every `SELECT`, `UPDATE`, `DELETE` and upsert conflict target.
+- Every repository function that touches `messages` or `users` on behalf of a user takes `userId: string` as a required parameter, and puts `user_id = $userId` in every `SELECT`, `UPDATE` and `DELETE`. Upserts filter on it too: `messages` conflicts on `(user_id, gmail_id)`, and `users` conflicts on `google_id` with the `WHERE users.user_id = EXCLUDED.user_id` guard (§5.2).
 - `userId` comes only from the verified token's `sub` (§3.1). It is never read from the request body, query string or path.
 - Exactly two functions may query without a `user_id` filter, and their names say so:
   - `findAccountByEmailUnscoped(email)`, for the webhook (§4.5);
-  - `listConnectedAccountsUnscoped()`, for the cron job (§4.6).
+  - `listConnectedAccountsUnscoped({ watchExpiringBefore })`, for the cron job (§4.6).
 - `SUPABASE_SERVICE_ROLE_KEY` is server-only and never logged or returned.
 
 ### 5.4 Token encryption
@@ -643,34 +651,8 @@ OAuth tokens are encrypted in application code before they reach the database. T
 - **Algorithm:** AES-256-GCM via Node `crypto`.
 - **Key:** `ENCRYPTION_KEY`, 32 random bytes encoded as base64. Startup fails if it doesn't decode to exactly 32 bytes.
 - **Stored form:** `v1:<iv b64>:<authTag b64>:<ciphertext b64>`, with a fresh 12-byte IV per write. The `v1` prefix allows key rotation later.
-- **Columns:** `public.users.refresh_token` and `public.users.access_token`. Only `src/db/` encrypts and decrypts, and plaintext tokens never leave the server process.
+- **Columns:** `users.refresh_token` and `users.access_token`. Only `src/db/` encrypts and decrypts, and plaintext tokens never leave the server process.
 - **Integrity:** a decryption failure (wrong key, or a tampered value) is treated as revoked: `GMAIL_TOKEN_REVOKED`.
-
-### 5.5 Database functions
-
-The server reaches the DB only through supabase-js (PostgREST). PostgREST runs each call in its own transaction and cannot express `::numeric` comparisons in a filter, so the sync's lock and its history-ID rule (§3.5, §4.5 step 5) live in two Postgres functions, called with `.rpc()`.
-
-Both are `SECURITY INVOKER` with an empty `search_path`, and only `service_role` may execute them (`EXECUTE` is revoked from `public`, `anon` and `authenticated`). Every statement inside filters on `p_user_id`, so they obey §5.3. Callers pass the `userId` from the verified token, as for any repository function.
-
-**`apply_sync_batch(p_user_id uuid, p_upserts jsonb, p_deletes text[], p_label_updates jsonb, p_new_history_id text) → boolean`**
-
-Commits the DB side of one sync (§3.5), full or incremental, atomically. The server makes every Gmail call first, then makes this single call. In one transaction it:
-
-1. takes `pg_advisory_xact_lock(hashtext(p_user_id::text))`;
-2. **stale guard:** if the stored `last_history_id` is not null and is numerically **greater than** `p_new_history_id`, a newer sync has already committed. It returns `false` and writes nothing, so a slower concurrent sync cannot overwrite newer rows;
-3. upserts `p_upserts` into `messages` on `(user_id, gmail_id)`. This is a JSON array of `messages` rows keyed by their §5.1 snake_case column names; `internal_date` is an ISO-8601 string. `id`, `user_id`, `synced_at`, `created_at` and `updated_at` are ignored if present: `user_id` is set to `p_user_id` and `synced_at` to `now()`;
-4. applies `p_label_updates`, a JSON array of `{ "gmail_id": string, "label_ids": string[] }`. It sets `label_ids`, `is_read = NOT ('UNREAD' = ANY(label_ids))` and `synced_at = now()` on rows that exist; unknown IDs are ignored;
-5. deletes the rows whose `gmail_id` is in `p_deletes`. Deletes run last, so a message both added and deleted within one batch ends up deleted;
-6. sets `last_history_id = p_new_history_id` if it is null or numerically lower, and always sets `last_synced_at = now()`;
-7. returns `true`.
-
-Empty arrays are allowed for `p_upserts`, `p_deletes` and `p_label_updates`. `p_new_history_id` must be a digit string. For a full sync it is the newest message's `historyId`; for an incremental sync it is the `history.list` response's `historyId`.
-
-**`advance_last_history_id(p_user_id uuid, p_history_id text) → boolean`**
-
-The §4.5 step 5 update on its own, for a path that has no message writes: `UPDATE public.users SET last_history_id = p_history_id, last_synced_at = now() WHERE user_id = p_user_id AND (last_history_id IS NULL OR last_history_id::numeric < p_history_id::numeric)`. It returns `true` if a row changed.
-
-Writes outside a sync use plain supabase-js calls with the `user_id` filter and need neither function. These are the §4.1 upsert (including its reset of `last_history_id` to `null`), the §4.3 upsert of a sent message, the §4.4 mark-as-read update and token persistence.
 
 ---
 
@@ -689,7 +671,7 @@ Writes outside a sync use plain supabase-js calls with the `user_id` filter and 
 
 ### Order
 
-1. **Schema session (draft).** On `schema`, write `supabase/migrations/<timestamp>_vibemail.sql` and `src/types/` implementing §5 and §3.4 exactly. Commit and push `schema`, but do **not** merge it or review it. Do not apply it to any remote Supabase project.
+1. **Schema session (draft).** On `schema`, write `supabase/migrations/<timestamp>_vibemail.sql` and `src/types/` implementing §5 and §3.4 exactly. Commit and push `schema`, but do **not** merge it or review it. It may be applied to the dev/test project in `.env`, which the integration tests need. It must not be applied to the production project.
 2. **Server session.** On `main`, build every unit of BUILD_SEQUENCE.md. Code imports types from `src/types/`. Because those files live only on `schema` until the merge, `main` on its own is not expected to typecheck. All verification runs on the integration check below.
 3. **Gate 1, the integration check.** In a throwaway worktree, merge `schema` into `main` without pushing:
 
@@ -697,7 +679,7 @@ Writes outside a sync use plain supabase-js calls with the `user_id` filter and 
    git worktree add ../vibemail-gate main
    cd ../vibemail-gate
    git merge --no-ff --no-edit schema
-   supabase db reset
+   # the dev/test project in .env must already have schema's migration applied
    npm test
    npm run typecheck
    npm run lint
@@ -708,7 +690,7 @@ Writes outside a sync use plain supabase-js calls with the `user_id` filter and 
 
 ### Forbidden
 
-- Merging `schema` (or applying its migration to a remote project) before Gate 1 has passed on the current tips of both branches.
+- Merging `schema` (or applying its migration to the production project) before Gate 1 has passed on the current tips of both branches.
 - Writing to `src/db/` (or anything else outside its ownership column) from the schema session, and writing to `supabase/migrations/` or `src/types/` from the server session.
 - Changing endpoint contracts (§4) from the schema session. A required change goes back to the server session.
 

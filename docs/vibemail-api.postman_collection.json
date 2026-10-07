@@ -1,0 +1,2171 @@
+{
+  "info": {
+    "name": "VibeMail Engine API",
+    "description": "Generated from CONTRACT.md §4. One folder per endpoint: a happy path first, then one request per error code the contract names for it.\n\nEvery JSON error uses the §3.3 envelope `{ error: { code, message, retryable, details? } }`.\n\nSet `jwt` to a Supabase access token for a user with Gmail connected, and `jwtUnconnected` to one for a user without.\n\nRequests whose description starts with \"Cannot be triggered by the request alone\" need the stated setup.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "4.1a Start Gmail connect — GET /api/v1/auth/google/start",
+      "description": "Returns a Google consent URL carrying an HMAC-signed, 10-minute `state` (CONTRACT.md §4.1a). Bearer required.",
+      "item": [
+        {
+          "name": "Happy path — 200 consent URL",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/start",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "start"
+              ]
+            },
+            "description": "Open `authorizationUrl` in a browser to consent. Google then redirects to the callback below. The `state` is also saved to `{{oauthState}}`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('authorizationUrl and expiresAt', () => {",
+                  "  pm.expect(body.authorizationUrl).to.include('accounts.google.com');",
+                  "  pm.expect(body.expiresAt).to.be.a('string');",
+                  "});",
+                  "const state = new URL(body.authorizationUrl).searchParams.get('state');",
+                  "if (state) pm.collectionVariables.set('oauthState', state);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "UNAUTHENTICATED — no Authorization header",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/start",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "start"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error envelope with code UNAUTHENTICATED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('UNAUTHENTICATED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "INTERNAL — server not configured",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/start",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "start"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: run the server without `JWT_SECRET`, `SUPABASE_URL` or `FRONTEND_URL` set."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 500', () => pm.response.to.have.status(500));",
+                  "pm.test('error envelope with code INTERNAL', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('INTERNAL');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4.1b OAuth callback — GET /api/v1/auth/google/callback",
+      "description": "Google redirects the browser here. No bearer: the signed `state` identifies the user. Every outcome is a 302 to `{FRONTEND_URL}/settings/gmail?status=…` (CONTRACT.md §4.1b). Redirect-following is disabled on these requests so the `Location` header can be checked.",
+      "item": [
+        {
+          "name": "Happy path — 302 status=connected",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/callback?code={{oauthCode}}&state={{oauthState}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "code",
+                  "value": "{{oauthCode}}"
+                },
+                {
+                  "key": "state",
+                  "value": "{{oauthState}}"
+                }
+              ]
+            },
+            "description": "Needs a real, unused Google authorization code in `{{oauthCode}}` and the matching `{{oauthState}}` from Start. In practice this step is completed by the browser after consent."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('302 redirect', () => pm.response.to.have.status(302));",
+                  "pm.test('status=connected', () => pm.expect(pm.response.headers.get('Location')).to.include('status=connected'));"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "UNAUTHENTICATED — tampered state",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/callback?code=any&state=tampered.state",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "code",
+                  "value": "any"
+                },
+                {
+                  "key": "state",
+                  "value": "tampered.state"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
+                  "pm.test('Location carries status=error&code=UNAUTHENTICATED', () => {",
+                  "  const location = pm.response.headers.get('Location');",
+                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('status=error');",
+                  "  pm.expect(location).to.include('code=UNAUTHENTICATED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "VALIDATION_FAILED — missing code",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/callback?state={{oauthState}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "state",
+                  "value": "{{oauthState}}"
+                }
+              ]
+            },
+            "description": "Needs a valid, unexpired `{{oauthState}}` (run Start first)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
+                  "pm.test('Location carries status=error&code=VALIDATION_FAILED', () => {",
+                  "  const location = pm.response.headers.get('Location');",
+                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('status=error');",
+                  "  pm.expect(location).to.include('code=VALIDATION_FAILED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "GMAIL_NOT_CONNECTED — consent denied",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/callback?error=access_denied&state={{oauthState}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "error",
+                  "value": "access_denied"
+                },
+                {
+                  "key": "state",
+                  "value": "{{oauthState}}"
+                }
+              ]
+            },
+            "description": "Simulates Google redirecting back after the user clicked Cancel. Needs a valid `{{oauthState}}`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
+                  "pm.test('Location carries status=error&code=GMAIL_NOT_CONNECTED', () => {",
+                  "  const location = pm.response.headers.get('Location');",
+                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('status=error');",
+                  "  pm.expect(location).to.include('code=GMAIL_NOT_CONNECTED');",
+                  "  pm.expect(location).to.include('reason=access_denied');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "GMAIL_TOKEN_REVOKED — invalid or reused code",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/callback?code=invalid-code&state={{oauthState}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "code",
+                  "value": "invalid-code"
+                },
+                {
+                  "key": "state",
+                  "value": "{{oauthState}}"
+                }
+              ]
+            },
+            "description": "Google rejects the made-up code with `invalid_grant`. Needs a valid `{{oauthState}}`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
+                  "pm.test('Location carries status=error&code=GMAIL_TOKEN_REVOKED', () => {",
+                  "  const location = pm.response.headers.get('Location');",
+                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('status=error');",
+                  "  pm.expect(location).to.include('code=GMAIL_TOKEN_REVOKED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "GMAIL_RATE_LIMITED — Google rate limit",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/callback?code={{oauthCode}}&state={{oauthState}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "code",
+                  "value": "{{oauthCode}}"
+                },
+                {
+                  "key": "state",
+                  "value": "{{oauthState}}"
+                }
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: exhaust the Google project quota, or point the server at a stub that answers 429."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
+                  "pm.test('Location carries status=error&code=GMAIL_RATE_LIMITED', () => {",
+                  "  const location = pm.response.headers.get('Location');",
+                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('status=error');",
+                  "  pm.expect(location).to.include('code=GMAIL_RATE_LIMITED');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "GMAIL_UPSTREAM_ERROR — Google 5xx",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/callback?code={{oauthCode}}&state={{oauthState}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "code",
+                  "value": "{{oauthCode}}"
+                },
+                {
+                  "key": "state",
+                  "value": "{{oauthState}}"
+                }
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: point the server at a stub that answers 5xx for the token or token-info call."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
+                  "pm.test('Location carries status=error&code=GMAIL_UPSTREAM_ERROR', () => {",
+                  "  const location = pm.response.headers.get('Location');",
+                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('status=error');",
+                  "  pm.expect(location).to.include('code=GMAIL_UPSTREAM_ERROR');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "INTERNAL — database unavailable",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google/callback?code={{oauthCode}}&state={{oauthState}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google",
+                "callback"
+              ],
+              "query": [
+                {
+                  "key": "code",
+                  "value": "{{oauthCode}}"
+                },
+                {
+                  "key": "state",
+                  "value": "{{oauthState}}"
+                }
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: stop local Supabase (`supabase stop`) before completing a consent."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
+                  "pm.test('Location carries status=error&code=INTERNAL', () => {",
+                  "  const location = pm.response.headers.get('Location');",
+                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('status=error');",
+                  "  pm.expect(location).to.include('code=INTERNAL');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "4.2 Message list — GET /api/v1/messages",
+      "description": "INBOX messages from the database, newest first, with an opaque cursor. Never calls Gmail (CONTRACT.md §4.2). Bearer required.",
+      "item": [
+        {
+          "name": "Happy path — 200 first page",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages?limit=25",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "25"
+                }
+              ]
+            },
+            "description": "Saves `nextCursor` to `{{cursor}}` and the first message ID to `{{gmailMessageId}}` for later requests."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('list shape', () => {",
+                  "  pm.expect(body.messages).to.be.an('array');",
+                  "  pm.expect(body).to.have.property('nextCursor');",
+                  "  pm.expect(body).to.have.property('lastSyncedAt');",
+                  "});",
+                  "if (body.nextCursor) pm.collectionVariables.set('cursor', body.nextCursor);",
+                  "if (body.messages.length) pm.collectionVariables.set('gmailMessageId', body.messages[0].gmailId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Happy path — 200 next page",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages?limit=25&cursor={{cursor}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "25"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{cursor}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "UNAUTHENTICATED — no Authorization header",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error envelope with code UNAUTHENTICATED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('UNAUTHENTICATED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GMAIL_NOT_CONNECTED — user has not connected Gmail",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwtUnconnected}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages"
+              ]
+            },
+            "description": "`{{jwtUnconnected}}` is a valid token for a Supabase user who never connected Gmail."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 409', () => pm.response.to.have.status(409));",
+                  "pm.test('error envelope with code GMAIL_NOT_CONNECTED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('GMAIL_NOT_CONNECTED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "VALIDATION_FAILED — limit out of range",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages?limit=500",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "500"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('error envelope with code VALIDATION_FAILED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('VALIDATION_FAILED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "INTERNAL — database unavailable",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: stop local Supabase (`supabase stop`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 500', () => pm.response.to.have.status(500));",
+                  "pm.test('error envelope with code INTERNAL', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('INTERNAL');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4.3 Message send — POST /api/v1/messages/send",
+      "description": "Sends a plain-text message, optionally into a thread, then stores it (CONTRACT.md §4.3). Bearer required. Body: `{ to, subject, body, threadId? }`.",
+      "item": [
+        {
+          "name": "Happy path — 201 sent",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "description": "Sends a real email to `{{recipient}}`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"{{recipient}}\",\n  \"subject\": \"Hello from VibeMail\",\n  \"body\": \"Sent through the VibeMail API.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "pm.test('sent message', () => pm.expect(pm.response.json().message.labelIds).to.include('SENT'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Happy path — 201 sent into a thread",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "description": "`{{threadId}}` must be a thread in the connected mailbox. It is passed to Gmail unchanged.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"{{recipient}}\",\n  \"subject\": \"Re: Hello from VibeMail\",\n  \"body\": \"Sent through the VibeMail API.\",\n  \"threadId\": \"{{threadId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "UNAUTHENTICATED — no Authorization header",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"{{recipient}}\",\n  \"subject\": \"Hello from VibeMail\",\n  \"body\": \"Sent through the VibeMail API.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error envelope with code UNAUTHENTICATED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('UNAUTHENTICATED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GMAIL_NOT_CONNECTED — user has not connected Gmail",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwtUnconnected}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"{{recipient}}\",\n  \"subject\": \"Hello from VibeMail\",\n  \"body\": \"Sent through the VibeMail API.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 409', () => pm.response.to.have.status(409));",
+                  "pm.test('error envelope with code GMAIL_NOT_CONNECTED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('GMAIL_NOT_CONNECTED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GMAIL_TOKEN_REVOKED — Google access revoked",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: revoke VibeMail at https://myaccount.google.com/permissions, then send. The stored tokens are cleared, so later requests return GMAIL_NOT_CONNECTED.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"{{recipient}}\",\n  \"subject\": \"Hello from VibeMail\",\n  \"body\": \"Sent through the VibeMail API.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error envelope with code GMAIL_TOKEN_REVOKED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('GMAIL_TOKEN_REVOKED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "VALIDATION_FAILED — missing and invalid fields",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "description": "Invalid `to`, a subject with a line break, and no `body`. `details.issues` lists all three.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"not-an-address\",\n  \"subject\": \"Header\\r\\nBcc: injected@example.com\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "const error = pm.response.json().error;",
+                  "pm.test('VALIDATION_FAILED with issues', () => {",
+                  "  pm.expect(error.code).to.eql('VALIDATION_FAILED');",
+                  "  pm.expect(error.details.issues.map((i) => i.field)).to.include.members(['to[0]', 'subject', 'body']);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "VALIDATION_FAILED — body is not JSON",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ not json",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('error envelope with code VALIDATION_FAILED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('VALIDATION_FAILED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "MESSAGE_NOT_FOUND — unknown threadId",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"{{recipient}}\",\n  \"subject\": \"Hello from VibeMail\",\n  \"body\": \"Sent through the VibeMail API.\",\n  \"threadId\": \"0000000000000000\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 404', () => pm.response.to.have.status(404));",
+                  "pm.test('error envelope with code MESSAGE_NOT_FOUND', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('MESSAGE_NOT_FOUND');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GMAIL_RATE_LIMITED — Gmail rate limit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: exceed Gmail sending limits, or point the server at a stub that answers 429. The response carries Retry-After when Google sends one.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"{{recipient}}\",\n  \"subject\": \"Hello from VibeMail\",\n  \"body\": \"Sent through the VibeMail API.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 429', () => pm.response.to.have.status(429));",
+                  "pm.test('error envelope with code GMAIL_RATE_LIMITED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('GMAIL_RATE_LIMITED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GMAIL_UPSTREAM_ERROR — Gmail 5xx",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: point the server at a stub that answers 5xx. If the send succeeded but fetching it back failed, `details.sentGmailId` is set: do not resend.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"{{recipient}}\",\n  \"subject\": \"Hello from VibeMail\",\n  \"body\": \"Sent through the VibeMail API.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 502', () => pm.response.to.have.status(502));",
+                  "pm.test('error envelope with code GMAIL_UPSTREAM_ERROR', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('GMAIL_UPSTREAM_ERROR');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "INTERNAL — database unavailable",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "send"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: stop local Supabase (`supabase stop`).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"{{recipient}}\",\n  \"subject\": \"Hello from VibeMail\",\n  \"body\": \"Sent through the VibeMail API.\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 500', () => pm.response.to.have.status(500));",
+                  "pm.test('error envelope with code INTERNAL', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('INTERNAL');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4.4 Mark as read — POST /api/v1/messages/{id}/read",
+      "description": "Marks one stored message read in Gmail and in the database. Idempotent. No body (CONTRACT.md §4.4). Bearer required.",
+      "item": [
+        {
+          "name": "Happy path — 200 marked read",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/{{gmailMessageId}}/read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "{{gmailMessageId}}",
+                "read"
+              ]
+            },
+            "description": "Run \"Message list → Happy path\" first to fill `{{gmailMessageId}}`. Sending twice returns 200 both times."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('isRead is true', () => pm.expect(pm.response.json().message.isRead).to.eql(true));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "UNAUTHENTICATED — no Authorization header",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/{{gmailMessageId}}/read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "{{gmailMessageId}}",
+                "read"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error envelope with code UNAUTHENTICATED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('UNAUTHENTICATED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GMAIL_NOT_CONNECTED — user has not connected Gmail",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwtUnconnected}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/{{gmailMessageId}}/read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "{{gmailMessageId}}",
+                "read"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: `{{jwtUnconnected}}` must belong to a user whose stored message row still exists but whose Gmail connection was removed or revoked. A user with no stored message gets MESSAGE_NOT_FOUND first."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 409', () => pm.response.to.have.status(409));",
+                  "pm.test('error envelope with code GMAIL_NOT_CONNECTED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('GMAIL_NOT_CONNECTED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GMAIL_TOKEN_REVOKED — Google access revoked",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/{{gmailMessageId}}/read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "{{gmailMessageId}}",
+                "read"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: revoke VibeMail at https://myaccount.google.com/permissions, then retry."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error envelope with code GMAIL_TOKEN_REVOKED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('GMAIL_TOKEN_REVOKED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "MESSAGE_NOT_FOUND — unknown message ID",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/0000000000000000/read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "0000000000000000",
+                "read"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 404', () => pm.response.to.have.status(404));",
+                  "pm.test('error envelope with code MESSAGE_NOT_FOUND', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('MESSAGE_NOT_FOUND');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GMAIL_RATE_LIMITED — Gmail rate limit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/{{gmailMessageId}}/read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "{{gmailMessageId}}",
+                "read"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: point the server at a stub that answers 429."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 429', () => pm.response.to.have.status(429));",
+                  "pm.test('error envelope with code GMAIL_RATE_LIMITED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('GMAIL_RATE_LIMITED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GMAIL_UPSTREAM_ERROR — Gmail 5xx",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/{{gmailMessageId}}/read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "{{gmailMessageId}}",
+                "read"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: point the server at a stub that answers 5xx."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 502', () => pm.response.to.have.status(502));",
+                  "pm.test('error envelope with code GMAIL_UPSTREAM_ERROR', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('GMAIL_UPSTREAM_ERROR');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "INTERNAL — database unavailable",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{jwt}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/messages/{{gmailMessageId}}/read",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "messages",
+                "{{gmailMessageId}}",
+                "read"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: stop local Supabase (`supabase stop`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 500', () => pm.response.to.have.status(500));",
+                  "pm.test('error envelope with code INTERNAL', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('INTERNAL');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4.5 Gmail push webhook — POST /webhook/gmail",
+      "description": "Google Pub/Sub push receiver, outside /api/v1. No bearer: authenticated by `?token=` equal to GOOGLE_PUBSUB_VERIFICATION_TOKEN. Acks with 200 before syncing in the background (CONTRACT.md §4.5).",
+      "item": [
+        {
+          "name": "Happy path — 200 acked",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/webhook/gmail?token={{pubsubToken}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "webhook",
+                "gmail"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{pubsubToken}}"
+                }
+              ]
+            },
+            "description": "Replays a Pub/Sub push for `{{gmailAddress}}`. The pre-request script base64-encodes `{ emailAddress, historyId }` into `message.data`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": {\n    \"data\": \"{{pushData}}\",\n    \"messageId\": \"1\",\n    \"publishTime\": \"2026-10-06T10:00:00Z\"\n  },\n  \"subscription\": \"projects/your-project-id/subscriptions/vibemail-push\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const payload = { emailAddress: pm.collectionVariables.get('gmailAddress'), historyId: '1' };",
+                  "pm.variables.set('pushData', btoa(JSON.stringify(payload)));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200, empty body', () => { pm.response.to.have.status(200); pm.expect(pm.response.text()).to.eql(''); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "UNAUTHENTICATED — wrong token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/webhook/gmail?token=wrong",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "webhook",
+                "gmail"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "wrong"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": {\n    \"data\": \"{{pushData}}\",\n    \"messageId\": \"1\",\n    \"publishTime\": \"2026-10-06T10:00:00Z\"\n  },\n  \"subscription\": \"projects/your-project-id/subscriptions/vibemail-push\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error envelope with code UNAUTHENTICATED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('UNAUTHENTICATED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "VALIDATION_FAILED — message.data is not base64 JSON",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/webhook/gmail?token={{pubsubToken}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "webhook",
+                "gmail"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{pubsubToken}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": {\n    \"data\": \"%%%not-base64%%%\",\n    \"messageId\": \"1\"\n  },\n  \"subscription\": \"s\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('error envelope with code VALIDATION_FAILED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('VALIDATION_FAILED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "INTERNAL — verification token not configured",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/webhook/gmail?token={{pubsubToken}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "webhook",
+                "gmail"
+              ],
+              "query": [
+                {
+                  "key": "token",
+                  "value": "{{pubsubToken}}"
+                }
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: run the server without GOOGLE_PUBSUB_VERIFICATION_TOKEN. The webhook fails closed.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": {\n    \"data\": \"{{pushData}}\",\n    \"messageId\": \"1\",\n    \"publishTime\": \"2026-10-06T10:00:00Z\"\n  },\n  \"subscription\": \"projects/your-project-id/subscriptions/vibemail-push\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 500', () => pm.response.to.have.status(500));",
+                  "pm.test('error envelope with code INTERNAL', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('INTERNAL');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4.6 Watch-renewal cron — GET /api/cron/renew-watch",
+      "description": "Daily Vercel Cron Job that renews Gmail watches (CONTRACT.md §4.6). Authenticated by `Authorization: Bearer {{cronSecret}}`. Built in BUILD_SEQUENCE.md unit 4.",
+      "item": [
+        {
+          "name": "Happy path — 200 counts",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cronSecret}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/cron/renew-watch",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "cron",
+                "renew-watch"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('counts', () => pm.expect(pm.response.json()).to.have.all.keys('renewed', 'revoked', 'failed', 'durationMs'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "UNAUTHENTICATED — no Authorization header",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/cron/renew-watch",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "cron",
+                "renew-watch"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('error envelope with code UNAUTHENTICATED', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('UNAUTHENTICATED');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "INTERNAL — CRON_SECRET not configured",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cronSecret}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/cron/renew-watch",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "cron",
+                "renew-watch"
+              ]
+            },
+            "description": "Cannot be triggered by the request alone. To reproduce: run the server without CRON_SECRET. The job fails closed."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 500', () => pm.response.to.have.status(500));",
+                  "pm.test('error envelope with code INTERNAL', () => {",
+                  "  const body = pm.response.json();",
+                  "  pm.expect(body.error.code).to.eql('INTERNAL');",
+                  "  pm.expect(body.error.message).to.be.a('string');",
+                  "  pm.expect(body.error.retryable).to.be.a('boolean');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000"
+    },
+    {
+      "key": "jwt",
+      "value": ""
+    },
+    {
+      "key": "jwtUnconnected",
+      "value": ""
+    },
+    {
+      "key": "gmailAddress",
+      "value": "you@example.com"
+    },
+    {
+      "key": "recipient",
+      "value": "friend@example.com"
+    },
+    {
+      "key": "gmailMessageId",
+      "value": ""
+    },
+    {
+      "key": "threadId",
+      "value": ""
+    },
+    {
+      "key": "cursor",
+      "value": ""
+    },
+    {
+      "key": "oauthState",
+      "value": ""
+    },
+    {
+      "key": "oauthCode",
+      "value": ""
+    },
+    {
+      "key": "pubsubToken",
+      "value": ""
+    },
+    {
+      "key": "cronSecret",
+      "value": ""
+    }
+  ]
+}

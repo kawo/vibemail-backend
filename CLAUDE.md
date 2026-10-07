@@ -15,31 +15,34 @@ Any change to an endpoint, an `ErrorCode` or a stored field goes into `CONTRACT.
 ## Stack
 
 - **Runtime and language:** Node.js and TypeScript in strict mode. TypeScript is **pinned to 6.x**, because `ts-jest` does not support 7.
-- **Gmail:** `googleapis`.
+- **Gmail:** `googleapis` (183.x) with `google-auth-library` 11.x.
+  - Construct clients only as `new OAuth2Client({ clientId, clientSecret, redirectUri })`; the positional form is deprecated.
+  - Detect revocation by `GaxiosError` with `response.data.error === 'invalid_grant'`.
+  - `users.watch` uses `labelFilterBehavior: 'INCLUDE'`; `labelFilterAction` is deprecated and ignored when the newer field is set.
 - **Database:** the Supabase JS client, using a single service-role client. There is no anon key.
 - **Auth tokens:** `jsonwebtoken` verifies Supabase access tokens.
 - **Tests:** Jest via `ts-jest`, plus `supertest`. `supertest` needs a small adapter, because the handlers take a Web `Request` rather than a Node `http.Server`.
 - **Deployment:** Vercel Functions under top-level `api/`, with no framework. Each file exports `GET`/`POST(request: Request): Promise<Response>` on the Node.js runtime (never Edge). `vercel.json` holds the cron job, the per-function `maxDuration`, and the `/webhook/gmail` rewrite.
 - **Two tsconfigs.** `tsconfig.json` keeps `rootDir: ./src` while also including `api/`, so plain `tsc` fails with TS6059. Never run bare `tsc`; Vercel compiles `api/` itself.
-  - **Type-checking:** always via `tsconfig.check.json`, which extends the base config with `rootDir: "."`, `noEmit` and `tests/`.
-  - **Jest:** when the Jest config is created, point ts-jest at that file: `transform: { '^.+\.ts$': ['ts-jest', { tsconfig: 'tsconfig.check.json' }] }`.
+  - **Type-checking:** always via `tsconfig.check.json`, which extends the base config with `rootDir: "."`, `noEmit`, `tests/`, and `types: ["node", "jest"]`. TypeScript 6 no longer loads `@types/*` packages automatically.
+  - **Target is ES2020:** there is no `Error.cause` or other ES2022 library API. Declare such fields explicitly (see `ProviderError`).
+  - **Jest:** `jest.config.js` (CommonJS; a `.ts` config fails to load as an ES module) points ts-jest at `tsconfig.check.json`.
 - **Blocked install scripts:** npm blocked them for `esbuild`, `unrs-resolver` and `@parcel/watcher`. If `vercel dev` or Jest resolution fails, check `npm install-scripts ls`.
 
 ## Commands
 
 ```bash
-npm test                            # jest --ci --runInBand (needs a jest.config pointing ts-jest at tsconfig.check.json)
+npm test                            # jest --ci --runInBand
 npx jest tests/unit/foo.test.ts     # single file
 npx jest -t "name of test"          # single test by name
 npm run typecheck                   # tsc -p tsconfig.check.json (src/, api/, tests/); `npm run build` runs the same
 npm run dev                         # vercel dev: local preview of api/
-supabase start                      # local Postgres/Auth for integration tests
-supabase db reset                   # re-apply supabase/migrations
+npx jest tests/integration          # integration tests against the dev/test Supabase project in .env (never production)
 npm run db:types                    # schema session only: regenerate src/types/database.ts from the linked project
 npm run db:push                     # pushes migrations to the hosted project; only after Gate 1 (CONTRACT.md §6)
 ```
 
-`--runInBand` is required because the integration tests share one local database. A run counts as passing only when `numFailedTests`, `numPendingTests` and `numTodoTests` are all 0 in `--json` output. A leftover `.only` surfaces as pending tests.
+`--runInBand` is required because the integration tests share one database: the dev/test project in `.env`. They create and delete `@vibemail.test` auth users there, and they need the schema branch's migration applied to that project. A run counts as passing only when `numFailedTests`, `numPendingTests` and `numTodoTests` are all 0 in `--json` output. A leftover `.only` surfaces as pending tests.
 
 ## The two-session architecture
 
@@ -78,15 +81,17 @@ With the Supabase GitHub integration, merging into `main` runs the migration on 
 - **Errors:** every error response uses the CONTRACT.md §3.3 envelope `{ error: { code, message, retryable, details? } }`, with the closed `ErrorCode` union. Do not add codes without updating §3.3.
 - **Pagination:** every list endpoint uses cursor-based pagination. The cursor is opaque base64url keyset `(internal_date DESC, gmail_id DESC)`, and responses return `nextCursor`. No offsets.
 - **Paths:** every client endpoint lives under `/api/v1`.
-- **Auth:** JWT Bearer auth on every `/api/v1` endpoint, *including* the OAuth callback (`POST /api/v1/auth/google/callback`). The callback needs the bearer to know which user the Gmail tokens belong to.
+- **Auth:** JWT Bearer auth on every `/api/v1` endpoint except `GET /api/v1/auth/google/callback`. That one is Google's browser redirect, authenticated by the HMAC-signed `state` issued by the bearer-protected `GET /api/v1/auth/google/start` (CONTRACT.md §4.1). The backend runs Google's code flow itself.
   - Tokens are verified with `jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'], audience: 'authenticated', issuer: SUPABASE_URL + '/auth/v1' })`. The algorithm allow-list is mandatory.
   - `userId` comes only from the token's `sub`.
 - **Machine endpoints** are outside `/api/v1` and don't use the user JWT:
   - The Pub/Sub webhook is at **`/webhook/gmail`**, implemented in `api/webhook/gmail.ts` and reached through a `vercel.json` rewrite. It authenticates with a `?token=` query parameter equal to `GOOGLE_PUBSUB_VERIFICATION_TOKEN`, compared in constant time.
-  - The cron job is at `/api/cron/renew-watches` and authenticates with the `CRON_SECRET` bearer.
+  - The cron job is at `/api/cron/renew-watch` and authenticates with the `CRON_SECRET` bearer.
+- **Account table:** `users`, keyed by `google_id` (the token-info `sub`), with a unique `user_id` linking it to the Supabase user. The connect upsert is `ON CONFLICT (google_id)` guarded by `user_id` (CONTRACT.md §5.2).
 - **Tenant isolation:** the service-role client bypasses RLS, so every user-scoped query lives in `src/db/` and filters on `user_id`.
-  - Only `findAccountByEmailUnscoped` (webhook) and `listConnectedAccountsUnscoped` (cron) may skip that filter.
+  - Only `findAccountByEmailUnscoped` (webhook) and `listConnectedAccountsUnscoped({ watchExpiringBefore })` (cron) may skip that filter.
   - RLS is enabled with no policies, which closes the public Data API.
-- **Sync state:** sync starts from the **stored** `last_history_id`, never from a notification's `historyId`. That value only advances, under a per-user advisory lock; both live in the `apply_sync_batch` / `advance_last_history_id` DB functions (CONTRACT.md §5.5). A `history.list` 404 falls back to a full sync of the 50 newest messages.
-- **Webhook responses:** the webhook returns non-2xx only when a retry could help, because Pub/Sub redelivers on any non-2xx.
-- **Replies:** the server derives the reply subject (`Re: <original>`), because Gmail threads only when the subject, `threadId`, `In-Reply-To` and `References` all match.
+- **History records carry only IDs:** label changes are deltas, applied to stored `label_ids`; an unknown message is fetched and stored; a 404 on `get` is skipped (CONTRACT.md §3.5).
+- **Sync state:** sync starts from the **stored** `history_id`, never from a notification's `historyId`. That value only advances, under a per-user advisory lock. A `history.list` 404 falls back to a full sync of the 50 newest messages.
+- **Webhook responses:** the webhook verifies the token and decodes the body, then returns `200` at once and runs the sync inside `waitUntil` (`@vercel/functions`). Background failures are logged, not retried. Never move sync work before the ack.
+- **Send:** the input is `{ to, subject, body, threadId? }`. `threadId` is passed to Gmail unchanged; no reply headers are derived. The sent message is fetched back with `messages.get`, because `messages.send` returns only `id`, `threadId` and `labelIds`.

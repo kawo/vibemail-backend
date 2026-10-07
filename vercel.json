@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [{ "source": "/webhook/gmail", "destination": "/api/webhook/gmail" }],
+  "crons": [{ "path": "/api/cron/renew-watch", "schedule": "0 6 * * *" }],
+  "functions": {
+    "api/v1/auth/google/callback.ts": { "maxDuration": 60 },
+    "api/webhook/gmail.ts": { "maxDuration": 60 },
+    "api/cron/renew-watch.ts": { "maxDuration": 300 }
+  }
+}

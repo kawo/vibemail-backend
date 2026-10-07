@@ -44,7 +44,7 @@ export type Database = {
           attachments: Json
           bcc_addresses: string[]
           body_html: string | null
-          body_text: string | null
+          body_plain: string | null
           cc_addresses: string[]
           created_at: string
           date_header: string | null
@@ -55,6 +55,7 @@ export type Database = {
           in_reply_to: string | null
           internal_date: string
           is_read: boolean
+          is_starred: boolean
           label_ids: string[]
           references: string | null
           rfc822_message_id: string | null
@@ -63,7 +64,7 @@ export type Database = {
           subject: string | null
           synced_at: string
           thread_id: string
-          to_addresses: string[]
+          to_address: string[]
           updated_at: string
           user_id: string
         }
@@ -71,7 +72,7 @@ export type Database = {
           attachments?: Json
           bcc_addresses?: string[]
           body_html?: string | null
-          body_text?: string | null
+          body_plain?: string | null
           cc_addresses?: string[]
           created_at?: string
           date_header?: string | null
@@ -82,6 +83,7 @@ export type Database = {
           in_reply_to?: string | null
           internal_date: string
           is_read: boolean
+          is_starred: boolean
           label_ids?: string[]
           references?: string | null
           rfc822_message_id?: string | null
@@ -90,7 +92,7 @@ export type Database = {
           subject?: string | null
           synced_at: string
           thread_id: string
-          to_addresses?: string[]
+          to_address?: string[]
           updated_at?: string
           user_id: string
         }
@@ -98,7 +100,7 @@ export type Database = {
           attachments?: Json
           bcc_addresses?: string[]
           body_html?: string | null
-          body_text?: string | null
+          body_plain?: string | null
           cc_addresses?: string[]
           created_at?: string
           date_header?: string | null
@@ -109,6 +111,7 @@ export type Database = {
           in_reply_to?: string | null
           internal_date?: string
           is_read?: boolean
+          is_starred?: boolean
           label_ids?: string[]
           references?: string | null
           rfc822_message_id?: string | null
@@ -117,7 +120,7 @@ export type Database = {
           subject?: string | null
           synced_at?: string
           thread_id?: string
-          to_addresses?: string[]
+          to_address?: string[]
           updated_at?: string
           user_id?: string
         }
@@ -129,7 +132,8 @@ export type Database = {
           access_token_expires_at: string | null
           created_at: string
           email: string
-          last_history_id: string | null
+          google_id: string
+          history_id: string | null
           last_synced_at: string | null
           refresh_token: string | null
           scopes: string[]
@@ -142,7 +146,8 @@ export type Database = {
           access_token_expires_at?: string | null
           created_at?: string
           email: string
-          last_history_id?: string | null
+          google_id: string
+          history_id?: string | null
           last_synced_at?: string | null
           refresh_token?: string | null
           scopes: string[]
@@ -155,7 +160,8 @@ export type Database = {
           access_token_expires_at?: string | null
           created_at?: string
           email?: string
-          last_history_id?: string | null
+          google_id?: string
+          history_id?: string | null
           last_synced_at?: string | null
           refresh_token?: string | null
           scopes?: string[]
@@ -170,20 +176,7 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
-      advance_last_history_id: {
-        Args: { p_history_id: string; p_user_id: string }
-        Returns: boolean
-      }
-      apply_sync_batch: {
-        Args: {
-          p_deletes: string[]
-          p_label_updates: Json
-          p_new_history_id: string
-          p_upserts: Json
-          p_user_id: string
-        }
-        Returns: boolean
-      }
+      [_ in never]: never
     }
     Enums: {
       [_ in never]: never

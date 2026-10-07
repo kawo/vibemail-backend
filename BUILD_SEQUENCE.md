@@ -14,27 +14,60 @@
 ## Units
 
 ### 1. Provider abstraction interface
-**What:** A TypeScript interface, `MailProvider`, through which all server logic talks to the mail provider. It only declares methods and contains no implementation. It covers the six Gmail operations in CONTRACT.md §4:
+**What:** `src/providers/provider.ts`, a provider-agnostic contract that every email backend implements. No provider SDK type appears in it, so sync, send, webhook and API code never see Gmail types.
 
-| Method | Gmail call it maps to | Used by |
+**Shared types:**
+- **`SyncCursor`:** an opaque branded string; Gmail stores its `historyId` here.
+- **`ProviderError`:** the only error a provider rejects with. Its `kind` is one of `revoked`, `rate_limited`, `not_found`, `cursor_expired` or `upstream`, with an optional `retryAfterSeconds` and `cause`.
+- **Messages:** a normalized `ProviderMessage` (every CONTRACT.md §5.1 source field) and a structured `OutgoingMessage`. Each implementation builds its own wire format.
+- **Changes:** `ProviderChange` with label deltas, `ChangePage`, `WatchResult`.
+- **Credentials:** `AccountCredentials`, `TokenUpdate`, `OnTokens`, `VerifiedGrant`.
+
+**`MailProvider`** (one mailbox, created by `MailProviderFactory.forAccount(credentials, onTokens)`):
+
+| Method | Gmail mapping (unit 2+) | Used by |
 |---|---|---|
-| `listInboxMessageIds(max)` | `users.messages.list` (`labelIds: ['INBOX']`) | Full sync (§4.2) |
-| `getMessage(id)` | `users.messages.get` (`format: 'full'`) | Sync, send (§4.2, §4.3) |
-| `listHistory(startHistoryId, pageToken?)` | `users.history.list` → `history[]` (`messagesAdded`, `messagesDeleted`, `labelsAdded`, `labelsRemoved`), `nextPageToken`, `historyId` | Incremental sync (§4.2) |
-| `sendMessage(raw, threadId?)` | `users.messages.send` (`raw` base64url) | Send (§4.3) |
+| `listInboxMessageIds(max)` | `users.messages.list` (`labelIds: ['INBOX']`) | Full sync (§3.5) |
+| `getMessage(id)` → `ProviderMessage` | `users.messages.get` (`format: 'full'`) + MIME parsing | Sync, send |
+| `listChanges(since, pageToken?)` → `ChangePage` | `users.history.list`; 404 → `ProviderError('cursor_expired')` | Incremental sync (§3.5) |
+| `sendMessage(OutgoingMessage)` | MIME build + `users.messages.send` | Send (§4.3) |
 | `markRead(id)` | `users.messages.modify` (`removeLabelIds: ['UNREAD']`) | Mark as read (§4.4) |
-| `watch()` | `users.watch` (`topicName`, `labelIds: ['INBOX']`) → `historyId`, `expiration` | Push registration and renewal (§4.5) |
+| `watch()` → `WatchResult` | `users.watch` (`labelFilterBehavior: 'INCLUDE'`) | §4.1, §4.5, §4.6 |
+| `refreshAccessToken()` | `OAuth2Client.refreshAccessToken` | Forced refresh |
+| `markUnread(id)` *(not used in v1)* | `users.messages.modify` (`addLabelIds: ['UNREAD']`) | none |
 
-**Verified:** TypeScript compiles clean (`npm run typecheck`), and the interface defines all required methods (the six above).
+**`MailProviderFactory`** (no account needed):
+- `providerId` and `wellKnownLabels` (`inbox`, `unread`);
+- `forAccount(...)`;
+- `verifyRefreshToken(refreshToken)` → `VerifiedGrant`, for §4.1 steps 3–5;
+- `compareCursors(a, b)`, for the §4.5 stale check and the advance-only rule;
+- *not used in v1:* `buildAuthorizationUrl(...)` and `exchangeAuthorizationCode(code)`, because the frontend signs in through Supabase.
+
+**Also in this unit:**
+- `tests/fakes/fakeProvider.ts`, an in-memory implementation reused by every later unit's tests. It can script failures and forbid all calls.
+- `tests/unit/provider.test.ts`.
+- `jest.config.js`, with ts-jest pointed at `tsconfig.check.json`.
+
+**Verified:** `npm run typecheck` is clean, the fake provider satisfies `MailProviderFactory` (`satisfies` check), the interface defines every method listed above, and `src/providers/provider.ts` contains no provider SDK import and no `any`.
 
 ### 2. Gmail OAuth layer with token persistence listener
 **What:** Everything that gets Google tokens and keeps them current:
+- **Files.**
+  - `src/providers/gmail/auth.ts`: the `OAuth2Client`, `buildAuthorizationUrl`, `exchangeAuthorizationCode`, refresh and token info, and `watch`. It has no DB access.
+  - `src/db/crypto.ts`: AES-256-GCM (CONTRACT.md §5.4).
+  - `src/db/users.ts`: the `users` repository, with `upsertConnectedUser`, `updateUserTokens`, `getUserCredentials` and `updateWatch`. It encrypts on write and decrypts on read.
+  - `src/services/gmailAccount.ts`: the §4.1b orchestration (exchange → check → upsert → watch → initial sync, with the `onTokens` hook calling `updateUserTokens` immediately).
+  - `src/middleware/oauthState.ts`: the HMAC-signed, 10-minute `state` (CONTRACT.md §4.1a).
 - **Bearer auth.** `requireUser(request)` in `src/middleware` verifies `Authorization: Bearer <Supabase access token>` with `jsonwebtoken` against `JWT_SECRET` (HS256 only, `aud: 'authenticated'`, issuer checked) and yields `userId` and `email` (CONTRACT.md §3.1). There are no cookies and no anon key.
-- **Connect Gmail.** `POST /api/v1/auth/google/callback` (CONTRACT.md §4.1). The frontend has already run Supabase's Google sign-in with `access_type: 'offline'` and `prompt: 'consent'`, and posts the `providerRefreshToken` it received. The backend then:
-  1. proves the token with one `refreshAccessToken()`;
-  2. checks with token info that the Google account's email equals the bearer's email and that both Gmail scopes were granted;
-  3. upserts `users` with the refresh token, access token, expiry and scopes;
-  4. calls `watch()`, then runs the initial full sync from unit 3. That sync is wired in once unit 3 exists; until then the step is a no-op.
+- **Connect Gmail (backend OAuth, CONTRACT.md §4.1).**
+  - `GET /api/v1/auth/google/start` (bearer) returns a consent URL carrying a signed `state`.
+  - `GET /api/v1/auth/google/callback` then:
+    1. verifies the `state`;
+    2. exchanges the `code`;
+    3. checks with token info that `gmail.modify`, `gmail.send` and `email` were granted, and that the Google account's email equals the email in the `state`;
+    4. upserts `users` on conflict `google_id` (token-info `sub`) with encrypted tokens;
+    5. calls `watch()` and runs the initial full sync;
+    6. redirects to `FRONTEND_URL`.
 - **Client factory.** Builds a per-user `googleapis` `OAuth2Client` and seeds it with the stored `refresh_token`, `access_token` and `expiry_date`. The library reuses the access token until it is within 5 minutes of expiry (`eagerRefreshThresholdMillis`, default 300 000 ms), then refreshes.
 - **Persistence listener.** Registered on the client with `client.on('tokens', …)`. The library emits this event on every refresh, and the listener:
   - always writes `access_token` and `access_token_expires_at` (from `expiry_date`) together;
@@ -44,14 +77,14 @@
 - **Revocation.** A refresh that fails with `invalid_grant` is surfaced as `GMAIL_TOKEN_REVOKED`, and the stored access token and its expiry are cleared.
 
 **Verified:** OAuth completes, tokens are stored, and refresh works without mismatch. Concretely:
-- A connect request with a valid bearer and a valid refresh token returns `200` and leaves a `users` row with non-null `refresh_token`, `access_token` and `access_token_expires_at`.
-- The same request is rejected:
-  - with `401 UNAUTHENTICATED` when there is no bearer;
-  - with `401 GMAIL_TOKEN_REVOKED` when the refresh token is bad;
-  - with `400 VALIDATION_FAILED` (`EMAIL_MISMATCH`) when the Google account's email differs from the bearer's;
-  - with `409 GMAIL_NOT_CONNECTED` when a Gmail scope is missing.
-
-  In each rejected case, no row is written.
+- A callback with a valid `state` and code redirects to `…?status=connected` and leaves a `users` row with non-null `refresh_token`, `access_token` and `access_token_expires_at`.
+- A failing callback redirects to `…?status=error&code=…` and writes no row. That covers each of these:
+  - a tampered or expired `state` (`UNAUTHENTICATED`);
+  - Google's `error=access_denied` (`GMAIL_NOT_CONNECTED`);
+  - a bad code (`GMAIL_TOKEN_REVOKED`);
+  - a different Google email (`VALIDATION_FAILED`, `EMAIL_MISMATCH`);
+  - a missing Gmail or `email` scope (`GMAIL_NOT_CONNECTED`).
+- `GET /api/v1/auth/google/start` returns `401` without a bearer.
 - With a stored access token more than 5 minutes from expiry, a Gmail call reuses it and makes no token-endpoint request.
 - With one within 5 minutes of expiry, the call triggers exactly one refresh, and the DB then holds the new `access_token` and its new expiry.
 - After any refresh, the refresh token held by the client is identical to the one in `users`, both when Google omits `refresh_token` from the response and when the `tokens` event delivers a rotated one.
@@ -59,52 +92,61 @@
 
 ### 3. Sync and read layer
 **What:** Gets mail from Gmail into the `messages` table and reads it back out as `MessageDTO`s (CONTRACT.md §4.2, §5.1). Its parts:
-- **Parser.** A pure function that turns a Gmail `format=full` message into a `messages` row. It matches headers case-insensitively, walks MIME parts recursively, base64url-decodes `text/plain` and `text/html`, collects attachment metadata, converts `internalDate` from epoch-ms, and derives `is_read` from the `UNREAD` label.
-- **Initial (full) sync.** `listInboxMessageIds(50)` is called once with no paging; Gmail returns IDs newest first. Then `getMessage` is called for each ID, each row is upserted on `(user_id, gmail_id)`, and `last_history_id` is set from the newest message.
-- **Incremental sync.** `listHistory` from `last_history_id`, with a fallback to full sync when Gmail returns 404.
+- **Parser.** Lives in `src/providers/gmail/`, behind `getMessage`. It is a pure function that turns a Gmail `format=full` message into a `ProviderMessage`: it matches headers case-insensitively, walks MIME parts recursively, base64url-decodes `text/plain` and `text/html`, collects attachment metadata, converts `internalDate` from epoch-ms, and derives `isRead` from the `UNREAD` label. `src/sync` then maps `ProviderMessage` to the `messages` row 1:1.
+- **Initial (full) sync.** `src/sync/index.ts`. `listInboxMessageIds(50)` pages with `pageToken` until 50 IDs are collected; Gmail returns IDs newest first. Then `getMessage` is called for each ID, each row is upserted on `(user_id, gmail_id)`, and `users.history_id` is set from the newest message's `historyId` (`messages.list` carries none). A message whose `get` returns 404 is skipped.
+- **Incremental sync.** `listChanges` from `history_id`, with a fallback to full sync when it rejects with `cursor_expired` (Gmail 404).
 - **Read side.** A repository query that returns INBOX rows ordered `(internal_date DESC, gmail_id DESC)` with keyset cursor pagination, mapped to `MessageDTO`. It never calls Gmail.
 - **Triggers.** Sync is push-driven only (CONTRACT.md §3.5): the full sync runs at connect (unit 2) and on the webhook's fallback, and the incremental sync runs from the webhook (unit 4). Nothing polls Gmail.
 
 **Verified:** Initial sync fetches 50 messages, the objects match the contract model, and incremental sync applies only the changes since the last sync. Concretely:
 - Against an inbox holding more than 50 messages, a first sync stores exactly the 50 newest.
 - Every stored row, and the `MessageDTO` read back from it, matches CONTRACT.md §5.1 / §3.4 field for field, with correct types and nulls. This is checked against a recorded fixture that includes nested multipart and an attachment.
-- **Incremental sync.** A second sync calls `history.list` with `startHistoryId` equal to the stored `last_history_id`. It then applies exactly the recorded changes and nothing else:
+- **Incremental sync.** A second sync calls `history.list` with `startHistoryId` equal to the stored `history_id`. It then applies exactly the recorded changes and nothing else:
   - one added message is fetched and inserted;
   - one deleted message's row is removed;
-  - a removed `UNREAD` label flips `is_read` to `true`.
+  - a removed `UNREAD` label flips `is_read` to `true`;
+  - a `messagesAdded` entry whose `get` returns 404 is skipped without failing the sync;
+  - an `INBOX` label added to a message that isn't stored causes one `get` and an insert with its full label set.
 
-  It makes no `messages.list` call, and `last_history_id` advances to the response's `historyId`.
-- **404 fallback.** When `history.list` returns 404, the sync falls back to a full sync (the 50 newest), and `last_history_id` is reset from the newest message.
+  It makes no `messages.list` call, and `history_id` advances to the response's `historyId`.
+- **404 fallback.** When `history.list` returns 404, the sync falls back to a full sync (the 50 newest), and `history_id` is reset from the newest message.
 - **No polling.** Listing messages through the read side, with a fake `MailProvider` that throws on any call, succeeds and makes zero Gmail calls.
 
 ### 4. Pub/Sub webhook receiver
 **What:** `POST /webhook/gmail` (CONTRACT.md §4.5; function file `api/webhook/gmail.ts`, reached through a `vercel.json` rewrite) together with watch registration and renewal:
 - **Authentication.** Compares the `?token=` query parameter to `GOOGLE_PUBSUB_VERIFICATION_TOKEN` in constant time, and fails closed if the variable is unset.
 - **Decoding.** Base64url-decodes `message.data` into `{ emailAddress, historyId }` and looks up the account by email.
-- **Delta.** If the notification's `historyId` is not newer than the stored `last_history_id`, it acks and makes no Gmail calls. Otherwise it runs unit 3's incremental sync from the **stored** `last_history_id`. The notification's ID is the mailbox's new state, not the start point.
-- **Concurrency.** `last_history_id` only ever advances, under a per-user advisory lock, so webhook and list syncs can't clobber each other. Both are implemented in the DB by `apply_sync_batch` / `advance_last_history_id` (CONTRACT.md §5.5), called with `.rpc()`.
-- **Acks.** `204` acks. Only retryable failures return non-2xx, which makes Pub/Sub redeliver.
-- **Watch.** `watch()` is called after the OAuth callback. Daily renewal is a separate cron job (`GET /api/cron/renew-watches`, CONTRACT.md §4.6), with its logic in `src/cron`; user requests never call `watch()`.
-- **Cron renewal.** The cron logic checks the `CRON_SECRET` bearer and fails closed if the secret is unset. It renews every connected account with a concurrency limit of 5, isolates failures per account, and clears tokens on `invalid_grant`.
+- **Delta.** If the notification's `historyId` is not newer than the stored `history_id`, it acks and makes no Gmail calls. Otherwise it runs unit 3's incremental sync from the **stored** `history_id`. The notification's ID is the mailbox's new state, not the start point.
+- **Concurrency.** `history_id` only ever advances, under a per-user advisory lock, so webhook and list syncs can't clobber each other.
+- **Acks.** `src/webhook/gmail.ts` checks the token and decodes the body, then returns `200` at once and runs the sync inside `waitUntil` (`@vercel/functions`). Background failures are logged, not retried; the next notification catches up from the stored `history_id`.
+- **Watch.** `watch()` is called after the OAuth callback. Daily renewal is a separate cron job (`GET /api/cron/renew-watch`, CONTRACT.md §4.6), with its logic in `src/cron`; user requests never call `watch()`.
+- **Cron renewal.** `src/cron/renewWatch.ts`, wired as `api/cron/renew-watch.ts` (daily `0 6 * * *`). The cron logic:
+  - checks the `CRON_SECRET` bearer, and fails closed if the secret is unset;
+  - renews every connected account whose watch is missing, expired or within 24 h of expiry, 5 at a time;
+  - isolates failures per account, and clears tokens on `invalid_grant`.
 
 **Verified:** A notification fetches the correct delta through history ID. Concretely:
-- Given a stored `last_history_id = H` and a notification carrying `historyId = H2 > H`, the receiver calls `history.list` with `startHistoryId = H`, never `H2`.
-- It applies exactly the adds, deletes and label changes recorded after `H`, and leaves `last_history_id` advanced (not regressed).
-- A replayed notification with `historyId ≤ H` makes zero Gmail calls and returns `204`.
+- Given a stored `history_id = H` and a notification carrying `historyId = H2 > H`, the receiver calls `history.list` with `startHistoryId = H`, never `H2`.
+- It applies exactly the adds, deletes and label changes recorded after `H`, and leaves `history_id` advanced (not regressed).
+- The response is `200`, and it is returned before any provider call.
+- A replayed notification with `historyId ≤ H` makes zero Gmail calls.
 - The renewal job, given three accounts where one throws `invalid_grant`, renews the other two, clears the third's tokens, and reports `{ renewed: 2, revoked: 1, failed: 0 }`.
 
 ### 5. Send layer
-**What:** `POST /api/v1/messages/send` (CONTRACT.md §4.3):
-- **Validation.** Recipients must be valid addresses, at most 100 in total. CR/LF in any header is rejected to block header injection. At least one of `text`/`html` is required.
-- **MIME builder.** Produces an RFC 2822 message: `From` is the account email from `public.users.email`, the subject is RFC 2047-encoded, and the body is `multipart/alternative` when both text and HTML are given, a single part otherwise.
-- **Send.** The message is base64url-encoded into `raw` and sent with `MailProvider.sendMessage(raw, threadId?)`.
-- **Replies.** Gmail threads a reply only when the request carries the original `threadId`, the `In-Reply-To`/`References` headers follow RFC 2822, and the `Subject` matches. So for a reply the builder sets `In-Reply-To` and `References` from the stored original, derives the subject server-side (CONTRACT.md §4.3: `Re: <original subject>` unless it already starts with `Re:`, ignoring any client `subject`), and passes the original's `thread_id`.
-- **Store.** The sent message is fetched back with `getMessage` and upserted through unit 3's parser, then returned as `201 { message }`.
+**What:** `src/send/index.ts`, behind `POST /api/v1/messages/send` (CONTRACT.md §4.3).
+- **Validation.** It accepts `{ to: string | string[], subject, body, threadId? }`. Recipients must be valid addresses, 1 to 100 of them. CR/LF in any header is rejected to block header injection.
+- **MIME builder.** `src/providers/gmail/mime.ts`, behind `sendMessage(OutgoingMessage)`. It produces an RFC 2822 message:
+  - `From` is the account email from `users.email`;
+  - the subject is RFC 2047-encoded when it isn't ASCII;
+  - the body is a single UTF-8 `text/plain` part;
+  - lines end in CRLF.
+- **Send.** The Gmail implementation base64url-encodes the MIME into `raw` and passes `threadId` through unchanged. No reply headers are derived.
+- **Store.** The sent message is fetched back with `getMessage` (`messages.send` returns only `id`, `threadId`, `labelIds`), normalized by the unit 3 parser, and upserted on `(user_id, gmail_id)`. A failure after a successful send reports `details.sentGmailId`.
 
 **Verified:** A message sends successfully through Gmail for an authenticated user. Concretely:
-- An authenticated `POST` returns `201` with a `MessageDTO` whose `gmailId` exists in Gmail and whose `labelIds` include `SENT`, and the same row is in `messages`.
-- The `raw` sent to Gmail decodes to valid MIME with the expected `From`/`To`/`Subject` and bodies.
-- An unauthenticated request returns `401 UNAUTHENTICATED` and makes no Gmail call.
+- A send for a connected user stores a row whose `gmail_id` is the one Gmail returned, whose `label_ids` include `SENT`, and whose `from_address` and `to_address` match the request.
+- The `raw` sent to Gmail decodes to valid MIME with the expected `From`/`To`/`Subject` and body, and `threadId` reaches Gmail unchanged.
+- An unconnected user gets `GMAIL_NOT_CONNECTED`, and invalid input gets `VALIDATION_FAILED`. Neither makes a Gmail call.
 
 ### 6. Mark-as-read layer
 **What:** The logic behind `POST /api/v1/messages/{id}/read` (CONTRACT.md §4.4):
@@ -121,12 +163,13 @@
 
 | Function file | Endpoint | Layer |
 |---|---|---|
-| `api/v1/auth/google/callback.ts` | `POST /api/v1/auth/google/callback` §4.1 | Unit 2 (`src/providers/gmail`) |
+| `api/v1/auth/google/start.ts` | `GET /api/v1/auth/google/start` §4.1a | Unit 2 (`src/middleware/oauthState.ts`) |
+| `api/v1/auth/google/callback.ts` | `GET /api/v1/auth/google/callback` §4.1b (no bearer; signed `state`) | Unit 2 (`src/services`) |
 | `api/v1/messages/index.ts` | `GET /api/v1/messages` §4.2 | Unit 3 read side (`src/db`) |
 | `api/v1/messages/send.ts` | `POST /api/v1/messages/send` §4.3 | Unit 5 (`src/send`) |
 | `api/v1/messages/[id]/read.ts` | `POST /api/v1/messages/{id}/read` §4.4 | Unit 6 |
 | `api/webhook/gmail.ts` | `POST /webhook/gmail` §4.5 (rewrite → `/api/webhook/gmail`) | Unit 4 (`src/webhook`) |
-| `api/cron/renew-watches.ts` | `GET /api/cron/renew-watches` §4.6 | Unit 4 (`src/cron`) |
+| `api/cron/renew-watch.ts` | `GET /api/cron/renew-watch` §4.6 | Unit 4 (`src/cron`) |
 
 Vercel details for these files:
 - **Handler shape.** Each file exports named Web-standard handlers, `export async function GET(request: Request): Promise<Response>` or `POST`, and nothing else. An HTTP method with no exported handler gets `405`.
@@ -136,17 +179,17 @@ Vercel details for these files:
   - returns `{ userId, email }`. All DB access goes through the `src/db` repository on the single service-role client, scoped by `userId` (CONTRACT.md §5.3);
   - fails with `UNAUTHENTICATED` when the token is missing or invalid.
 
-  The four user-facing functions call it first.
+  Every `/api/v1` function calls it first, except the OAuth callback, which verifies the signed `state` instead.
 - **Path param.** `[id]/read.ts` reads `id` from `new URL(request.url).pathname`, decodes it, and rejects an empty value with `VALIDATION_FAILED`.
 - **Routing.** `vercel.json` holds the rewrite `/webhook/gmail` → `/api/webhook/gmail`.
-- **Duration.** `vercel.json` sets `functions["api/v1/auth/google/callback.ts"].maxDuration` and `functions["api/webhook/gmail.ts"].maxDuration`, because both run a sync. It also sets `functions["api/cron/renew-watches.ts"].maxDuration = 300`, and the `crons` entry from CONTRACT.md §4.6. A function that exceeds it gets a platform `504`.
+- **Duration.** `vercel.json` sets `functions["api/v1/auth/google/callback.ts"].maxDuration` and `functions["api/webhook/gmail.ts"].maxDuration`, because both run a sync. It also sets `functions["api/cron/renew-watch.ts"].maxDuration = 300`, and the `crons` entry from CONTRACT.md §4.6. A function that exceeds it gets a platform `504`.
 - **Env.** Local env comes from `vercel env pull`.
 
-**Verified:** All six endpoints respond correctly in local preview (`vercel dev` with the local Supabase stack):
-- `vercel dev` lists all six functions at the exact paths in the table, and nothing is served under `/api/` except those.
+**Verified:** All seven endpoints respond correctly in local preview (`vercel dev` with the local Supabase stack):
+- `vercel dev` lists all seven functions at the exact paths in the table, and nothing is served under `/api/` except those.
 - Each endpoint returns its CONTRACT.md §4 success status and body shape for a valid request.
 - Each returns `405` for an unsupported method.
-- Every user-facing function returns `401 UNAUTHENTICATED` without a bearer and with a tampered or expired one. A valid local-Supabase user token is accepted, and no response sets a cookie.
+- Every bearer-protected function returns `401 UNAUTHENTICATED` without a bearer and with a tampered or expired one. A valid local-Supabase user token is accepted, and no response sets a cookie.
 - Each returns the correct §3.3 envelope for an unauthenticated or invalid one.
 - The webhook is exercised by replaying a recorded Pub/Sub push body to `/webhook/gmail?token=$GOOGLE_PUBSUB_VERIFICATION_TOKEN`, and returns `401` with a wrong or missing token.
 - An `OPTIONS` preflight to any `/api/v1` endpoint from `FRONTEND_URL` returns `204` with the CORS headers in CONTRACT.md §3.2.
@@ -154,26 +197,25 @@ Vercel details for these files:
 - A real Google-signed delivery is out of scope for this unit; it is checked on a Vercel preview deployment.
 
 ### 8. Integration tests
-**What:** The Jest integration suite (`ts-jest`, `tests/integration/`) that proves CONTRACT.md §2 end to end. It runs against a **running local Supabase stack** (real Postgres, Auth and PostgREST), not a mocked database client.
-- **Database.** The suite runs in the Gate 1 worktree (`main` merged with `schema`, CONTRACT.md §6). The stack is started with `supabase start` and reset with `supabase db reset` before the run, which applies the schema branch's migration from `supabase/migrations/`. Local URL and keys come from `supabase status`.
-- **Gmail.** Gmail is replaced by a fake `MailProvider` (unit 1) loaded with recorded `format=full`, `history.list`, `send` and `watch` fixtures. No Google account or network is needed.
-- **Coverage.** The suite includes:
-  - every endpoint's success path and every `ErrorCode` in its error table (§2, criterion 2);
-  - the sync, fallback and 50-message cap cases;
-  - webhook delta and duplicate handling;
-  - cron auth (`401` without the bearer, fail closed without `CRON_SECRET`) and per-account failure isolation;
-  - mark-read idempotence;
-  - reply threading;
-  - `invalid_grant` → `GMAIL_TOKEN_REVOKED`;
-  - an isolation test using two real local Auth users, proving that user A cannot read or modify user B's rows through any endpoint;
-  - a check that RLS is enabled with no policies, so a direct Data API call with a user token returns no rows;
-  - rejection of a token signed with the wrong secret, of one with `alg: none`, and of one with the wrong audience.
-- **Hosted projects.** No hosted Supabase project is touched, in line with CONTRACT.md §6. If the Supabase GitHub integration is enabled, `schema` must not be merged into `main` before Gate 1, because merging runs the migration against production.
+**What:** The Jest integration suite (`ts-jest`, `tests/integration/`) that proves CONTRACT.md §2 end to end. It runs against the **live dev/test Supabase project in `.env`** (real Postgres, Auth and PostgREST), not a mocked database client.
+- **Database.**
+  - The suite runs in the Gate 1 worktree (`main` merged with `schema`, CONTRACT.md §6), with the schema branch's migration already applied to the dev/test project.
+  - `tests/integration/support.ts` reads `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` from `.env`. If either is missing, the run fails; it never skips.
+  - Each test creates real Supabase Auth users (`@vibemail.test`) and deletes them in `afterAll`, and their rows cascade away with them.
+- **Gmail.** Gmail is replaced by the fake `MailProvider` (unit 1). No Google account or network is needed.
+- **Auth.** Bearer tokens are signed with a test secret. The server verifies them locally (CONTRACT.md §3.1), so the project's real JWT secret is not needed.
+- **Failures.** `INTERNAL` is produced by a real database failure, using a client with an invalid key, not by a mock.
+- **Files.**
+  - `endpoints.test.ts`: every §4 endpoint, every status code, and every `error.code` in its error table, plus cross-user isolation.
+  - `webhook.test.ts`: acknowledge-first, and the delta fetched from the stored `history_id`.
+  - `oauthPersistence.test.ts`: token encryption at rest, the pairing CHECK, and the token persistence listener.
+  - Message normalisation is a unit test: `tests/unit/normalisation.test.ts`.
 
-**Verified:** The full suite passes with no skipped tests against live Supabase, where "live" means the running local stack. Concretely:
-- After `supabase db reset`, `jest --ci --runInBand --json --outputFile=jest-results.json` exits 0. `--runInBand` is used because all tests share one local database.
+**Verified:** The full suite passes with no skipped tests against the live dev/test Supabase project. Concretely:
+- `jest --ci --runInBand --json --outputFile=jest-results.json` exits 0. `--runInBand` is used because all tests share one database.
 - In the JSON report, `numFailedTests`, `numPendingTests` and `numTodoTests` are all `0`, and `numPassedTests === numTotalTests`.
 - Jest has no option to fail on `.only`. Instead, a leftover `.only` shows up because Jest reports every test it skipped as pending, so `numPendingTests` is no longer `0`. The lint gate also bans it with `eslint-plugin-jest`'s `jest/no-focused-tests`, set to `error`.
+- After the run, no `@vibemail.test` auth users remain in the project.
 
 ---
 
