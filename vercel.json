@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "npm run typecheck && mkdir -p public",
+  "buildCommand": "npm run typecheck && mkdir -p public && printf 'User-agent: *\nDisallow: /\n' > public/robots.txt",
   "outputDirectory": "public",
   "rewrites": [
     {
