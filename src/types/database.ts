@@ -135,6 +135,7 @@ export type Database = {
           google_id: string
           history_id: string | null
           last_synced_at: string | null
+          name: string | null
           refresh_token: string | null
           scopes: string[]
           updated_at: string
@@ -149,6 +150,7 @@ export type Database = {
           google_id: string
           history_id?: string | null
           last_synced_at?: string | null
+          name?: string | null
           refresh_token?: string | null
           scopes: string[]
           updated_at?: string
@@ -163,6 +165,7 @@ export type Database = {
           google_id?: string
           history_id?: string | null
           last_synced_at?: string | null
+          name?: string | null
           refresh_token?: string | null
           scopes?: string[]
           updated_at?: string
