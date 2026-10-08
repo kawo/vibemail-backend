@@ -1,66 +1,21 @@
 {
   "info": {
     "name": "VibeMail Engine API",
-    "description": "Generated from CONTRACT.md §4. One folder per endpoint: a happy path first, then one request per error code the contract names for it.\n\nEvery JSON error uses the §3.3 envelope `{ error: { code, message, retryable, details? } }`.\n\nSet `jwt` to a Supabase access token for a user with Gmail connected, and `jwtUnconnected` to one for a user without.\n\nRequests whose description starts with \"Cannot be triggered by the request alone\" need the stated setup.",
+    "description": "Generated from CONTRACT.md §4. One folder per endpoint: a happy path first, then one request per error code the contract names for it.\n\nEvery JSON error uses the §3.3 envelope `{ error: { code, message, retryable, details? } }`.\n\nSet `jwt` to a Supabase access token for a user with Gmail connected (sign in through 4.1a in a browser and copy `access_token` from the `/auth/callback#…` fragment), and `jwtUnconnected` to one for a user without.\n\nRequests whose description starts with \"Cannot be triggered by the request alone\" need the stated setup.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
     {
-      "name": "4.1a Start Gmail connect — GET /api/v1/auth/google/start",
-      "description": "Returns a Google consent URL carrying an HMAC-signed, 10-minute `state` (CONTRACT.md §4.1a). Bearer required.",
+      "name": "4.1a Start Google sign-in — GET /api/v1/auth/google",
+      "description": "No auth. Sets the HttpOnly `vibemail_oauth_state` cookie and 302s to Google consent with an HMAC-signed, 10-minute `state` (CONTRACT.md §4.1a). Redirect-following is disabled so `Location` and `Set-Cookie` can be checked; finish the flow in a browser.",
       "item": [
         {
-          "name": "Happy path — 200 consent URL",
-          "request": {
-            "method": "GET",
-            "header": [
-              {
-                "key": "Authorization",
-                "value": "Bearer {{jwt}}",
-                "type": "text"
-              }
-            ],
-            "url": {
-              "raw": "{{baseUrl}}/api/v1/auth/google/start",
-              "host": [
-                "{{baseUrl}}"
-              ],
-              "path": [
-                "api",
-                "v1",
-                "auth",
-                "google",
-                "start"
-              ]
-            },
-            "description": "Open `authorizationUrl` in a browser to consent. Google then redirects to the callback below. The `state` is also saved to `{{oauthState}}`."
-          },
-          "event": [
-            {
-              "listen": "test",
-              "script": {
-                "type": "text/javascript",
-                "exec": [
-                  "pm.test('status 200', () => pm.response.to.have.status(200));",
-                  "const body = pm.response.json();",
-                  "pm.test('authorizationUrl and expiresAt', () => {",
-                  "  pm.expect(body.authorizationUrl).to.include('accounts.google.com');",
-                  "  pm.expect(body.expiresAt).to.be.a('string');",
-                  "});",
-                  "const state = new URL(body.authorizationUrl).searchParams.get('state');",
-                  "if (state) pm.collectionVariables.set('oauthState', state);"
-                ]
-              }
-            }
-          ]
-        },
-        {
-          "name": "UNAUTHENTICATED — no Authorization header",
+          "name": "Happy path — 302 to Google with the state cookie",
           "request": {
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{baseUrl}}/api/v1/auth/google/start",
+              "raw": "{{baseUrl}}/api/v1/auth/google",
               "host": [
                 "{{baseUrl}}"
               ],
@@ -68,8 +23,52 @@
                 "api",
                 "v1",
                 "auth",
-                "google",
-                "start"
+                "google"
+              ]
+            },
+            "description": "The `state` is saved to `{{oauthState}}`. Postman keeps the cookie in its jar for the callback requests."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('302 redirect', () => pm.response.to.have.status(302));",
+                  "const location = pm.response.headers.get('Location');",
+                  "pm.test('Location is Google consent', () => pm.expect(location).to.include('accounts.google.com'));",
+                  "pm.test('state cookie is HttpOnly, Secure, SameSite=Lax', () => {",
+                  "  const cookie = pm.response.headers.get('Set-Cookie');",
+                  "  pm.expect(cookie).to.include('vibemail_oauth_state=');",
+                  "  pm.expect(cookie).to.include('HttpOnly');",
+                  "  pm.expect(cookie).to.include('Secure');",
+                  "  pm.expect(cookie).to.include('SameSite=Lax');",
+                  "});",
+                  "const state = new URL(location).searchParams.get('state');",
+                  "if (state) pm.collectionVariables.set('oauthState', state);"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "METHOD_NOT_ALLOWED — POST",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/google",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "google"
               ]
             }
           },
@@ -79,31 +78,26 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('status 401', () => pm.response.to.have.status(401));",
-                  "pm.test('error envelope with code UNAUTHENTICATED', () => {",
+                  "pm.test('status 405', () => pm.response.to.have.status(405));",
+                  "pm.test('error envelope with code METHOD_NOT_ALLOWED', () => {",
                   "  const body = pm.response.json();",
-                  "  pm.expect(body.error.code).to.eql('UNAUTHENTICATED');",
+                  "  pm.expect(body.error.code).to.eql('METHOD_NOT_ALLOWED');",
                   "  pm.expect(body.error.message).to.be.a('string');",
                   "  pm.expect(body.error.retryable).to.be.a('boolean');",
-                  "});"
+                  "});",
+                  "pm.test('Allow: GET', () => pm.expect(pm.response.headers.get('Allow')).to.eql('GET'));"
                 ]
               }
             }
           ]
         },
         {
-          "name": "INTERNAL — server not configured",
+          "name": "CONFIG_ERROR — server not configured",
           "request": {
             "method": "GET",
-            "header": [
-              {
-                "key": "Authorization",
-                "value": "Bearer {{jwt}}",
-                "type": "text"
-              }
-            ],
+            "header": [],
             "url": {
-              "raw": "{{baseUrl}}/api/v1/auth/google/start",
+              "raw": "{{baseUrl}}/api/v1/auth/google",
               "host": [
                 "{{baseUrl}}"
               ],
@@ -111,11 +105,10 @@
                 "api",
                 "v1",
                 "auth",
-                "google",
-                "start"
+                "google"
               ]
             },
-            "description": "Cannot be triggered by the request alone. To reproduce: run the server without `JWT_SECRET`, `SUPABASE_URL` or `FRONTEND_URL` set."
+            "description": "Cannot be triggered by the request alone. To reproduce: run the server without `JWT_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` or `GOOGLE_REDIRECT_URI` set."
           },
           "event": [
             {
@@ -124,9 +117,9 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test('status 500', () => pm.response.to.have.status(500));",
-                  "pm.test('error envelope with code INTERNAL', () => {",
+                  "pm.test('error envelope with code CONFIG_ERROR', () => {",
                   "  const body = pm.response.json();",
-                  "  pm.expect(body.error.code).to.eql('INTERNAL');",
+                  "  pm.expect(body.error.code).to.eql('CONFIG_ERROR');",
                   "  pm.expect(body.error.message).to.be.a('string');",
                   "  pm.expect(body.error.retryable).to.be.a('boolean');",
                   "});"
@@ -138,11 +131,11 @@
       ]
     },
     {
-      "name": "4.1b OAuth callback — GET /api/v1/auth/google/callback",
-      "description": "Google redirects the browser here. No bearer: the signed `state` identifies the user. Every outcome is a 302 to `{FRONTEND_URL}/settings/gmail?status=…` (CONTRACT.md §4.1b). Redirect-following is disabled on these requests so the `Location` header can be checked.",
+      "name": "4.1b Google sign-in callback — GET /api/v1/auth/google/callback",
+      "description": "Google redirects the browser here. No bearer: the signed `state` plus the matching state cookie from 4.1a identify the browser. Every outcome is a 302 to `{FRONTEND_URL}/auth/callback?status=…`; on success the Supabase session is in the URL fragment (CONTRACT.md §4.1b). Redirect-following is disabled on these requests so the `Location` header can be checked.",
       "item": [
         {
-          "name": "Happy path — 302 status=connected",
+          "name": "Happy path — 302 status=signed_in",
           "request": {
             "method": "GET",
             "header": [],
@@ -169,7 +162,7 @@
                 }
               ]
             },
-            "description": "Needs a real, unused Google authorization code in `{{oauthCode}}` and the matching `{{oauthState}}` from Start. In practice this step is completed by the browser after consent."
+            "description": "Needs a real, unused Google authorization code in `{{oauthCode}}` and the matching `{{oauthState}}` from 4.1a, sent from the same cookie jar. In practice this step is completed by the browser after consent."
           },
           "event": [
             {
@@ -178,7 +171,7 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test('302 redirect', () => pm.response.to.have.status(302));",
-                  "pm.test('status=connected', () => pm.expect(pm.response.headers.get('Location')).to.include('status=connected'));"
+                  "pm.test('status=signed_in with the session in the fragment', () => {\n  const location = pm.response.headers.get('Location');\n  pm.expect(location).to.include('/auth/callback?status=signed_in');\n  pm.expect(location).to.include('#access_token=');\n});"
                 ]
               }
             }
@@ -225,7 +218,7 @@
                   "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
                   "pm.test('Location carries status=error&code=UNAUTHENTICATED', () => {",
                   "  const location = pm.response.headers.get('Location');",
-                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('/auth/callback?');",
                   "  pm.expect(location).to.include('status=error');",
                   "  pm.expect(location).to.include('code=UNAUTHENTICATED');",
                   "});"
@@ -272,7 +265,7 @@
                   "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
                   "pm.test('Location carries status=error&code=VALIDATION_FAILED', () => {",
                   "  const location = pm.response.headers.get('Location');",
-                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('/auth/callback?');",
                   "  pm.expect(location).to.include('status=error');",
                   "  pm.expect(location).to.include('code=VALIDATION_FAILED');",
                   "});"
@@ -323,7 +316,7 @@
                   "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
                   "pm.test('Location carries status=error&code=GMAIL_NOT_CONNECTED', () => {",
                   "  const location = pm.response.headers.get('Location');",
-                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('/auth/callback?');",
                   "  pm.expect(location).to.include('status=error');",
                   "  pm.expect(location).to.include('code=GMAIL_NOT_CONNECTED');",
                   "  pm.expect(location).to.include('reason=access_denied');",
@@ -375,7 +368,7 @@
                   "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
                   "pm.test('Location carries status=error&code=GMAIL_TOKEN_REVOKED', () => {",
                   "  const location = pm.response.headers.get('Location');",
-                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('/auth/callback?');",
                   "  pm.expect(location).to.include('status=error');",
                   "  pm.expect(location).to.include('code=GMAIL_TOKEN_REVOKED');",
                   "});"
@@ -426,7 +419,7 @@
                   "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
                   "pm.test('Location carries status=error&code=GMAIL_RATE_LIMITED', () => {",
                   "  const location = pm.response.headers.get('Location');",
-                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('/auth/callback?');",
                   "  pm.expect(location).to.include('status=error');",
                   "  pm.expect(location).to.include('code=GMAIL_RATE_LIMITED');",
                   "});"
@@ -477,7 +470,7 @@
                   "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
                   "pm.test('Location carries status=error&code=GMAIL_UPSTREAM_ERROR', () => {",
                   "  const location = pm.response.headers.get('Location');",
-                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('/auth/callback?');",
                   "  pm.expect(location).to.include('status=error');",
                   "  pm.expect(location).to.include('code=GMAIL_UPSTREAM_ERROR');",
                   "});"
@@ -528,7 +521,7 @@
                   "pm.test('302 redirect to the frontend', () => pm.response.to.have.status(302));",
                   "pm.test('Location carries status=error&code=INTERNAL', () => {",
                   "  const location = pm.response.headers.get('Location');",
-                  "  pm.expect(location).to.include('/settings/gmail?');",
+                  "  pm.expect(location).to.include('/auth/callback?');",
                   "  pm.expect(location).to.include('status=error');",
                   "  pm.expect(location).to.include('code=INTERNAL');",
                   "});"

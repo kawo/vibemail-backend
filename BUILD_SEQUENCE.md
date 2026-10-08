@@ -56,18 +56,20 @@
   - `src/providers/gmail/auth.ts`: the `OAuth2Client`, `buildAuthorizationUrl`, `exchangeAuthorizationCode`, refresh and token info, and `watch`. It has no DB access.
   - `src/db/crypto.ts`: AES-256-GCM (CONTRACT.md §5.4).
   - `src/db/users.ts`: the `users` repository, with `upsertConnectedUser`, `updateUserTokens`, `getUserCredentials` and `updateWatch`. It encrypts on write and decrypts on read.
-  - `src/services/gmailAccount.ts`: the §4.1b orchestration (exchange → check → upsert → watch → initial sync, with the `onTokens` hook calling `updateUserTokens` immediately).
-  - `src/middleware/oauthState.ts`: the HMAC-signed, 10-minute `state` (CONTRACT.md §4.1a).
-- **Bearer auth.** `requireUser(request)` in `src/middleware` verifies `Authorization: Bearer <Supabase access token>` with `jsonwebtoken` against `JWT_SECRET` (HS256 only, `aud: 'authenticated'`, issuer checked) and yields `userId` and `email` (CONTRACT.md §3.1). There are no cookies and no anon key.
-- **Connect Gmail (backend OAuth, CONTRACT.md §4.1).**
-  - `GET /api/v1/auth/google/start` (bearer) returns a consent URL carrying a signed `state`.
+  - `src/services/gmailAccount.ts`: the §4.1b orchestration (exchange → check → Supabase sign-in → upsert → watch → initial sync, with the `onTokens` hook calling `updateUserTokens` immediately).
+  - `src/services/supabaseSession.ts`: `signInWithIdToken` on a throwaway client, returning the Supabase session.
+  - `src/middleware/oauthState.ts`: the HMAC-signed, 10-minute `state` and its browser-binding cookie (CONTRACT.md §4.1a).
+- **Bearer auth.** `requireUser(request)` in `src/middleware` verifies `Authorization: Bearer <Supabase access token>` with `jsonwebtoken` against `JWT_SECRET` (HS256 only, `aud: 'authenticated'`, issuer checked) and yields `userId` and `email` (CONTRACT.md §3.1). There are no session cookies and no anon key.
+- **Sign in with Google (backend OAuth, CONTRACT.md §4.1).**
+  - `GET /api/v1/auth/google` (no auth) sets the state cookie and 302s to a consent URL carrying a signed `state`.
   - `GET /api/v1/auth/google/callback` then:
-    1. verifies the `state`;
+    1. verifies the `state` and that the cookie's nonce matches it;
     2. exchanges the `code`;
-    3. checks with token info that `gmail.modify`, `gmail.send` and `email` were granted, and that the Google account's email equals the email in the `state`;
-    4. upserts `users` on conflict `google_id` (token-info `sub`) with encrypted tokens;
-    5. calls `watch()` and runs the initial full sync;
-    6. redirects to `FRONTEND_URL`.
+    3. checks with token info that `gmail.modify`, `gmail.send` and `email` were granted, and that an `id_token` came back;
+    4. signs in to Supabase with the `id_token`, which creates the user on first sign-in;
+    5. upserts `users` on conflict `google_id` (token-info `sub`) with encrypted tokens;
+    6. calls `watch()` and runs the initial full sync;
+    7. redirects to `FRONTEND_URL/auth/callback`, with the session in the fragment.
 - **Client factory.** Builds a per-user `googleapis` `OAuth2Client` and seeds it with the stored `refresh_token`, `access_token` and `expiry_date`. The library reuses the access token until it is within 5 minutes of expiry (`eagerRefreshThresholdMillis`, default 300 000 ms), then refreshes.
 - **Persistence listener.** Registered on the client with `client.on('tokens', …)`. The library emits this event on every refresh, and the listener:
   - always writes `access_token` and `access_token_expires_at` (from `expiry_date`) together;
@@ -77,14 +79,15 @@
 - **Revocation.** A refresh that fails with `invalid_grant` is surfaced as `GMAIL_TOKEN_REVOKED`, and the stored access token and its expiry are cleared.
 
 **Verified:** OAuth completes, tokens are stored, and refresh works without mismatch. Concretely:
-- A callback with a valid `state` and code redirects to `…?status=connected` and leaves a `users` row with non-null `refresh_token`, `access_token` and `access_token_expires_at`.
-- A failing callback redirects to `…?status=error&code=…` and writes no row. That covers each of these:
-  - a tampered or expired `state` (`UNAUTHENTICATED`);
+- A callback with a valid `state`, the matching state cookie and a code redirects to `…/auth/callback?status=signed_in#access_token=…`. It leaves a `users` row with non-null `refresh_token`, `access_token` and `access_token_expires_at`.
+- A failing callback redirects to `…?status=error&code=…`, with no fragment, and writes no row. That covers each of these:
+  - a tampered or expired `state`, or a missing or mismatched state cookie (`UNAUTHENTICATED`);
   - Google's `error=access_denied` (`GMAIL_NOT_CONNECTED`);
   - a bad code (`GMAIL_TOKEN_REVOKED`);
-  - a different Google email (`VALIDATION_FAILED`, `EMAIL_MISMATCH`);
-  - a missing Gmail or `email` scope (`GMAIL_NOT_CONNECTED`).
-- `GET /api/v1/auth/google/start` returns `401` without a bearer.
+  - a Supabase user whose email differs (`VALIDATION_FAILED`, `EMAIL_MISMATCH`);
+  - a missing Gmail or `email` scope (`GMAIL_NOT_CONNECTED`);
+  - Supabase rejecting the ID token (`INTERNAL`, `SUPABASE_SIGN_IN_FAILED`).
+- `GET /api/v1/auth/google` needs no bearer: it sets the state cookie and returns `302` to Google.
 - With a stored access token more than 5 minutes from expiry, a Gmail call reuses it and makes no token-endpoint request.
 - With one within 5 minutes of expiry, the call triggers exactly one refresh, and the DB then holds the new `access_token` and its new expiry.
 - After any refresh, the refresh token held by the client is identical to the one in `users`, both when Google omits `refresh_token` from the response and when the `tokens` event delivers a rotated one.
@@ -163,8 +166,8 @@
 
 | Function file | Endpoint | Layer |
 |---|---|---|
-| `api/v1/auth/google/start.ts` | `GET /api/v1/auth/google/start` §4.1a | Unit 2 (`src/middleware/oauthState.ts`) |
-| `api/v1/auth/google/callback.ts` | `GET /api/v1/auth/google/callback` §4.1b (no bearer; signed `state`) | Unit 2 (`src/services`) |
+| `api/v1/auth/google/index.ts` | `GET /api/v1/auth/google` §4.1a (no auth; 302 + state cookie) | Unit 2 (`src/middleware/oauthState.ts`) |
+| `api/v1/auth/google/callback.ts` | `GET /api/v1/auth/google/callback` §4.1b (no bearer; signed `state` + cookie) | Unit 2 (`src/services`) |
 | `api/v1/messages/index.ts` | `GET /api/v1/messages` §4.2 | Unit 3 read side (`src/db`) |
 | `api/v1/messages/send.ts` | `POST /api/v1/messages/send` §4.3 | Unit 5 (`src/send`) |
 | `api/v1/messages/[id]/read.ts` | `POST /api/v1/messages/{id}/read` §4.4 | Unit 6 |
@@ -179,7 +182,7 @@ Vercel details for these files:
   - returns `{ userId, email }`. All DB access goes through the `src/db` repository on the single service-role client, scoped by `userId` (CONTRACT.md §5.3);
   - fails with `UNAUTHENTICATED` when the token is missing or invalid.
 
-  Every `/api/v1` function calls it first, except the OAuth callback, which verifies the signed `state` instead.
+  Every `/api/v1` function calls it first, except the two sign-in endpoints: the start takes no auth, and the callback verifies the signed `state` and its cookie instead.
 - **Path param.** `[id]/read.ts` reads `id` from `new URL(request.url).pathname`, decodes it, and rejects an empty value with `VALIDATION_FAILED`.
 - **Routing.** `vercel.json` holds the rewrite `/webhook/gmail` → `/api/webhook/gmail`.
 - **Duration.** `vercel.json` sets `functions["api/v1/auth/google/callback.ts"].maxDuration` and `functions["api/webhook/gmail.ts"].maxDuration`, because both run a sync. It also sets `functions["api/cron/renew-watch.ts"].maxDuration = 300`, and the `crons` entry from CONTRACT.md §4.6. A function that exceeds it gets a platform `504`.

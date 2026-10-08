@@ -68,7 +68,9 @@ The project is complete when **every** item below is true and verifiable.
 
 ### 3.1 Authentication
 
-- **No cookies.** Every `/api/v1` endpoint except the Google OAuth callback requires `Authorization: Bearer <Supabase access token>`. That includes `GET /api/v1/auth/google/start` (§4.1). The frontend gets the token from its own Supabase sign-in. The callback is a browser redirect from Google and can't carry a header, so it authenticates with the signed `state` issued by the start endpoint (§4.1).
+- **No session cookies.** Every `/api/v1` endpoint except the two Google sign-in endpoints requires `Authorization: Bearer <Supabase access token>`.
+  - The frontend gets that token from the sign-in flow (§4.1), which hands over a Supabase session.
+  - The sign-in endpoints are browser navigations and can't carry a header. The start endpoint needs no auth. The callback authenticates with the signed `state`, bound to the browser by a short-lived state cookie (§4.1a). That is the only cookie the API sets, and it never holds a session.
   - **Verification.** The token is checked locally with `jsonwebtoken`, using `jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'], audience: 'authenticated', issuer: SUPABASE_URL + '/auth/v1' })`.
     - The `algorithms` allow-list is mandatory. It blocks `alg: none` and algorithm-confusion attacks.
     - **Prerequisite:** the Supabase project must sign user tokens with the legacy shared secret (HS256). A project switched to asymmetric signing keys would make every request fail `UNAUTHENTICATED`.
@@ -86,7 +88,9 @@ The project is complete when **every** item below is true and verifiable.
     - `refresh_token` is written only when Google returns a new one.
   - **Paired columns.** `access_token` and `access_token_expires_at` are always written together, or both set to `null`. `google-auth-library` treats a credential with no `expiry_date` as *never expiring*, so an access token stored without an expiry would never be refreshed. A DB `CHECK` enforces the pairing (§5.2).
   - **Revocation.** On `invalid_grant`, both access-token columns are set to `null`.
-- **Gmail grant: backend OAuth.** The backend runs Google's authorization-code flow itself (§4.1): consent URL → `GET /api/v1/auth/google/callback` → code exchange. Supabase is used only for the user's own sign-in, not for Gmail tokens.
+- **Gmail grant: backend OAuth.** The backend runs Google's authorization-code flow itself (§4.1): `GET /api/v1/auth/google` → consent → `GET /api/v1/auth/google/callback` → code exchange.
+  - The exchange's `id_token` signs the user in to Supabase (`signInWithIdToken`).
+  - Gmail tokens never pass through Supabase Auth; they are stored encrypted in `users` (§5.4).
 - Required Google scopes: `openid`, `https://www.googleapis.com/auth/userinfo.email`, `https://www.googleapis.com/auth/userinfo.profile`, `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/gmail.send`. The consent URL uses `access_type=offline` and `prompt=consent`, so that Google returns a refresh token.
   - Google's token info returns the account's `email` and `sub` only when `userinfo.email` was granted.
   - `openid` makes the code exchange return an `id_token`. With `userinfo.profile`, that token carries the account's `name`.
@@ -101,7 +105,7 @@ The project is complete when **every** item below is true and verifiable.
 - **CORS.** Every `/api/v1` endpoint allows exactly one origin, `FRONTEND_URL`.
   - Responses carry `Access-Control-Allow-Origin: <FRONTEND_URL>` and `Vary: Origin`.
   - `OPTIONS` preflights get `204`, with `Access-Control-Allow-Methods: GET, POST`, `Access-Control-Allow-Headers: Authorization, Content-Type` and `Access-Control-Max-Age: 600`.
-  - No credentials are allowed (there are no cookies).
+  - No credentials are allowed: bearer endpoints use no cookies.
   - The webhook and cron endpoints send no CORS headers.
 - JSON request and response bodies use camelCase. DB columns use snake_case.
 - Timestamps in JSON are ISO-8601 UTC strings (`2026-10-03T14:05:00.000Z`).
@@ -220,91 +224,87 @@ The procedure is shared by the connect endpoint (§4.1) and the webhook (§4.5);
 | `FRONTEND_URL` | CORS (§3.2) |
 | `CRON_SECRET` | Cron authentication (§4.6). The name is fixed by Vercel |
 
-A missing required variable fails the function with `500 INTERNAL` and a log line naming the variable, never its value. The OAuth redirect endpoints (§4.1b, §4.1c) answer `500 CONFIG_ERROR` instead.
+A missing required variable fails the function with `500 INTERNAL` and a log line naming the variable, never its value. The sign-in endpoints (§4.1a, §4.1b) answer `500 CONFIG_ERROR` instead.
 
 ---
 
 ## 4. Endpoint contracts
 
-### 4.1 Connect Gmail — backend OAuth flow
+### 4.1 Sign in with Google — backend OAuth flow
 
-Two endpoints, plus a redirect variant of the start endpoint:
-- **Start** (`GET /api/v1/auth/google/start`): the frontend `fetch`es it with the bearer, then sends the browser to the returned URL.
-- **Redirect start** (`GET /api/v1/auth/google`, §4.1c): the same as Start, but it answers `302` to Google.
-- **Callback** (`GET /api/v1/auth/google/callback`): Google redirects the browser there, and it redirects back to the frontend.
+Google sign-in is the only way in. One flow signs the user in to Supabase and connects their Gmail in the same step. Neither endpoint takes a bearer.
+- **Start** (`GET /api/v1/auth/google`): the browser navigates there, for example from a "Sign in with Google" link. It answers `302` to Google.
+- **Callback** (`GET /api/v1/auth/google/callback`): Google redirects the browser there. It answers `302` to the frontend, carrying the Supabase session.
 
-#### 4.1a Start — `GET /api/v1/auth/google/start`
+**Prerequisite:** Supabase Auth must have the Google provider enabled, with `GOOGLE_CLIENT_ID` listed among its authorized client IDs. Otherwise every sign-in ends with `INTERNAL` and `reason=SUPABASE_SIGN_IN_FAILED`.
 
-**Request:** `Authorization: Bearer <Supabase access token>` (§3.1). No body or query.
+#### 4.1a Start — `GET /api/v1/auth/google`
 
-**Behavior:** issue a signed `state`, then build the consent URL with `buildAuthorizationUrl` (scopes from §3.1, `access_type=offline`, `prompt=consent`, `login_hint = claims.email`).
+**Request:** no auth, body or query.
 
-**State format:** `base64url(JSON.stringify({ sub, email, exp, nonce }))` + `.` + `base64url(HMAC-SHA256(JWT_SECRET, payload))`, where:
-- `sub` and `email` come from the bearer's claims;
+**Behavior:** `initiateOAuth` (`src/providers/gmail/auth.ts`) issues a signed `state` and builds the consent URL (scopes from §3.1, `access_type=offline`, `prompt=consent`).
+
+**State format:** `base64url(JSON.stringify({ exp, nonce }))` + `.` + `base64url(HMAC-SHA256(JWT_SECRET, payload))`, where:
 - `exp` is now + 10 minutes (epoch seconds);
 - `nonce` is 16 random bytes.
 
-**Response — `200 OK`**
+**State cookie** (login-CSRF defence): `vibemail_oauth_state=<nonce>; Path=/api/v1/auth/google; Max-Age=600; HttpOnly; Secure; SameSite=Lax`. It binds the `state` to the browser that started the flow. It is the only cookie the API sets, and it never holds a session.
 
-```ts
-interface StartGmailConnectResponse {
-  authorizationUrl: string;  // https://accounts.google.com/o/oauth2/v2/auth?...&state=...
-  expiresAt: string;         // ISO-8601; when the state stops being accepted
-}
-```
-
-**Errors:** `UNAUTHENTICATED` (401), `INTERNAL` (500).
-
-#### 4.1b Callback — `GET /api/v1/auth/google/callback?code&state` (or `?error&state`)
-
-No bearer: the signed `state` identifies the user. Every outcome is a **`302`** to the frontend:
-
-| Outcome | `Location` |
-|---|---|
-| Connected | `{FRONTEND_URL}/settings/gmail?status=connected&initialSync=completed\|failed` |
-| Any error | `{FRONTEND_URL}/settings/gmail?status=error&code=<ErrorCode>[&reason=<details.reason>]` |
-
-**Behavior**
-
-1. **Verify `state`.**
-   - The HMAC is checked in constant time and `exp` must be in the future.
-   - A missing, tampered or expired state → `UNAUTHENTICATED`.
-   - This yields `user_id = sub` and `expectedEmail = email`.
-2. **Handle denial.** If Google sent `error` (e.g. `access_denied`) instead of `code` → `GMAIL_NOT_CONNECTED` with `reason=<Google error>`. A missing `code` → `VALIDATION_FAILED`.
-3. **Exchange the code** with `exchangeAuthorizationCode` (`OAuth2Client.getToken`), then call `getTokenInfo(tokens.access_token)`.
-   - `sub` and `email` come from token info.
-   - `name` comes from the `name` claim of the exchange's `id_token`. That token is read without a signature check, because it came straight from Google's token endpoint over TLS (OpenID Connect Core §3.1.3.7). A missing claim gives `name = null` and doesn't fail the connect.
-   - `invalid_grant` (expired or reused code) → `GMAIL_TOKEN_REVOKED`.
-   - No refresh token returned → `GMAIL_NOT_CONNECTED`.
-4. **Check identity.** Token info must have `email` and `sub`; otherwise → `GMAIL_NOT_CONNECTED` with `reason=missing_email_scope`. The email must equal `expectedEmail` (case-insensitive); otherwise → `VALIDATION_FAILED` with `reason=EMAIL_MISMATCH`.
-   - This is the CSRF defence: a victim tricked into completing a flow started with an attacker's `state` authorizes the victim's own Google account, whose email doesn't match the attacker's.
-5. **Check scopes.** If `gmail.modify` or `gmail.send` is missing → `GMAIL_NOT_CONNECTED` with `reason=missing_gmail_scope`.
-6. **Upsert** `users` on conflict `google_id` (linking rules in §5.2) with `google_id` (token-info `sub`), `user_id`, `email` (token-info `email`), `name` (id_token `name`), `refresh_token`, `scopes`, and `access_token` / `access_token_expires_at` as a pair (§3.1). Reset `history_id` to `null` on re-connect (this forces a full sync). Linking conflicts → `VALIDATION_FAILED` with `reason=GOOGLE_ACCOUNT_LINKED_ELSEWHERE` or `ANOTHER_GOOGLE_ACCOUNT_LINKED`.
-7. Call `MailProvider.watch()` (§4.5). If it fails, the failure is logged; it doesn't fail the connect.
-8. Run the initial **full sync** (§3.5). If it fails, the failure is logged and `initialSync=failed`. `history_id` then stays `null`, so the next push notification runs the full sync instead.
-
-**Error codes** (in the redirect's `code` parameter): `UNAUTHENTICATED`, `VALIDATION_FAILED`, `GMAIL_TOKEN_REVOKED`, `GMAIL_NOT_CONNECTED`, `GMAIL_RATE_LIMITED`, `GMAIL_UPSTREAM_ERROR`, `INTERNAL`.
-
-If the configuration itself is missing (e.g. `FRONTEND_URL`), the callback answers `500 CONFIG_ERROR` with the §3.3 envelope instead of redirecting. Any method other than `GET` → `405 METHOD_NOT_ALLOWED` (envelope, `Allow: GET`).
-
-#### 4.1c Redirect start — `GET /api/v1/auth/google`
-
-The same as §4.1a, but it answers with a redirect instead of JSON.
-
-**Request:** `Authorization: Bearer <Supabase access token>` (§3.1). No body or query.
-
-**Behavior:** `initiateOAuth` (`src/providers/gmail/auth.ts`) issues the signed `state` (format as in §4.1a) for the bearer's `sub` and `email`, and builds the consent URL. The response is **`302`** with `Location: <consent URL>` and `Cache-Control: no-store`.
-
-A browser's top-level navigation can't send an `Authorization` header. So this endpoint serves clients that can set headers on the request they follow, for example native apps and webviews. Browser frontends use §4.1a.
+**Response — `302 Found`:** `Location: <consent URL>`, `Cache-Control: no-store`, `Set-Cookie: <state cookie>`.
 
 **Errors** (§3.3 envelope, no redirect):
 
 | Code | HTTP | When |
 |---|---|---|
 | `METHOD_NOT_ALLOWED` | 405 | Any method other than `GET`. Sets `Allow: GET`. |
-| `UNAUTHENTICATED` | 401 | Missing or invalid bearer. |
-| `CONFIG_ERROR` | 500 | `JWT_SECRET`, `SUPABASE_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` or another required variable is missing. |
+| `CONFIG_ERROR` | 500 | `JWT_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` or another required variable is missing. |
 | `INTERNAL` | 500 | An unexpected exception. |
+
+#### 4.1b Callback — `GET /api/v1/auth/google/callback?code&state` (or `?error&state`)
+
+No bearer. Every outcome is a **`302`** to `{FRONTEND_URL}/auth/callback`, with `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, and a `Set-Cookie` that clears the state cookie.
+
+| Outcome | `Location` |
+|---|---|
+| Signed in | `{FRONTEND_URL}/auth/callback?status=signed_in&initialSync=completed\|failed#access_token=…&refresh_token=…&expires_in=…&expires_at=…&token_type=bearer` |
+| Any error | `{FRONTEND_URL}/auth/callback?status=error&code=<ErrorCode>[&reason=<details.reason>]` (no fragment) |
+
+The session tokens travel **only in the fragment**: browsers never send it to a server, so it stays out of request logs and `Referer` headers. The frontend reads it, calls `supabase.auth.setSession({ access_token, refresh_token })`, then clears it with `history.replaceState`.
+
+**Behavior**
+
+1. **Verify `state`.**
+   - The HMAC is checked in constant time and `exp` must be in the future.
+   - The state cookie must be present, and its nonce must equal the state's `nonce` (constant-time comparison).
+   - A missing, tampered or expired state, or a missing or mismatched cookie → `UNAUTHENTICATED`.
+2. **Handle denial.** If Google sent `error` (e.g. `access_denied`) instead of `code` → `GMAIL_NOT_CONNECTED` with `reason=<Google error>`. A missing `code` → `VALIDATION_FAILED`.
+3. **Exchange the code** with `exchangeAuthorizationCode` (`OAuth2Client.getToken`), then call `getTokenInfo(tokens.access_token)`.
+   - `sub` and `email` come from token info.
+   - `name` comes from the `name` claim of the exchange's `id_token`. That token is read without a signature check, because it came straight from Google's token endpoint over TLS (OpenID Connect Core §3.1.3.7). A missing claim gives `name = null` and doesn't fail the sign-in.
+   - `invalid_grant` (expired or reused code) → `GMAIL_TOKEN_REVOKED`.
+4. **Check the grant**, before any sign-in or write. Each failure → `GMAIL_NOT_CONNECTED`, with the `reason`:
+   - no refresh token: `no_refresh_token`;
+   - no `email` or `sub` in token info: `missing_email_scope`;
+   - no `id_token`: `missing_openid_scope`;
+   - `gmail.modify` or `gmail.send` missing: `missing_gmail_scope`.
+5. **Sign in to Supabase** with `auth.signInWithIdToken({ provider: 'google', token: id_token, access_token })`.
+   - Supabase verifies the token and creates the user on first sign-in.
+   - It runs on a fresh, throwaway client, never the shared service-role client, because signing in stores the user's session on the client.
+   - A rejection → `INTERNAL` with `reason=SUPABASE_SIGN_IN_FAILED`. The Supabase message is logged.
+   - The Supabase user's email must equal token info's `email` (case-insensitive); otherwise → `VALIDATION_FAILED` with `reason=EMAIL_MISMATCH`.
+6. **Upsert** `users` on conflict `google_id` (linking rules in §5.2), with:
+   - `google_id` (token-info `sub`), `user_id` (the Supabase user's `id`), `email` (token-info `email`) and `name` (id_token `name`);
+   - `refresh_token`, `scopes`, and `access_token` / `access_token_expires_at` as a pair (§3.1).
+
+   Reset `history_id` to `null` on re-sign-in; this forces a full sync. Linking conflicts → `VALIDATION_FAILED` with `reason=GOOGLE_ACCOUNT_LINKED_ELSEWHERE` or `ANOTHER_GOOGLE_ACCOUNT_LINKED`.
+7. Call `MailProvider.watch()` (§4.5). If it fails, the failure is logged; it doesn't fail the sign-in.
+8. Run the initial **full sync** (§3.5). If it fails, the failure is logged and `initialSync=failed`. `history_id` then stays `null`, so the next push notification runs the full sync instead.
+
+If a step after 5 fails, the redirect carries the error and no session. The Supabase user may already exist by then; signing in again retries the connect.
+
+**Error codes** (in the redirect's `code` parameter): `UNAUTHENTICATED`, `VALIDATION_FAILED`, `GMAIL_TOKEN_REVOKED`, `GMAIL_NOT_CONNECTED`, `GMAIL_RATE_LIMITED`, `GMAIL_UPSTREAM_ERROR`, `INTERNAL`.
+
+If the configuration itself is missing (e.g. `FRONTEND_URL`), the callback answers `500 CONFIG_ERROR` with the §3.3 envelope instead of redirecting. Any method other than `GET` → `405 METHOD_NOT_ALLOWED` (envelope, `Allow: GET`).
 
 ---
 
@@ -640,8 +640,8 @@ Constraints and indexes:
 | Column | Postgres type | Nullable | Source |
 |---|---|---|---|
 | `google_id` | `text` PK | no | Token-info `sub` of the connected Google account (§4.1). This is the upsert conflict target |
-| `user_id` | `uuid` `UNIQUE`, FK → `auth.users(id)` on delete cascade | no | `sub` claim of the verified bearer token (§3.1) |
-| `email` | `text` `UNIQUE` | no | Token-info `email` from the §4.1b exchange. It must match the bearer's `claims.email`, case-insensitively |
+| `user_id` | `uuid` `UNIQUE`, FK → `auth.users(id)` on delete cascade | no | `id` of the Supabase user returned by `signInWithIdToken` (§4.1b step 5) |
+| `email` | `text` `UNIQUE` | no | Token-info `email` from the §4.1b exchange. It must match the Supabase user's email, case-insensitively |
 | `name` | `text` | yes | The `name` claim of the §4.1b exchange's `id_token` (needs the `userinfo.profile` scope); `null` when absent |
 | `refresh_token` | `text`: ciphertext (§5.4) | yes | `refresh_token` from the §4.1b code exchange (or Google's rotated one later); `null` after revocation (§4.5, §4.6) |
 | `scopes` | `text[]` | no | Granted scopes from token info |
