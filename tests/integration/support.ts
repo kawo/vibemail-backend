@@ -22,6 +22,7 @@ import type { ProviderMessage, VerifiedGrant } from '../../src/providers/provide
 import { toMessageRow } from '../../src/db/messages';
 import type { Database } from '../../src/types';
 import { type FakeMailbox, createFakeMailbox, createFakeProviderFactory, cursor } from '../fakes/fakeProvider';
+import { FakeSessions } from '../fakes/fakeSessions';
 
 export const TEST_JWT_SECRET = 'integration-test-jwt-secret-not-for-production-use';
 export const FRONTEND_URL = 'https://app.vibemail.test';
@@ -109,6 +110,7 @@ export function grantFor(user: TestUser, overrides: Partial<VerifiedGrant> = {})
     accountId: user.googleId,
     email: user.email,
     name: 'Test User',
+    idToken: `id-token-${user.userId}`,
     scopes: [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE],
     credentials: {
       refreshToken: `refresh-${user.userId}`,
@@ -123,22 +125,33 @@ export interface App {
   handlers: ReturnType<typeof createHandlers>;
   deps: AppDeps;
   box: FakeMailbox;
+  sessions: FakeSessions;
   /** Background work handed to `waitUntil` (webhook). */
   pending: Array<Promise<unknown>>;
 }
 
 /**
  * The real handlers on the live database, with Gmail faked. `grant` is what the fake returns
- * for an OAuth code exchange. `db` defaults to the service-role client.
+ * for an OAuth code exchange. `db` defaults to the service-role client. Supabase sign-in with a
+ * Google ID token can't run without a real Google token, so it is faked: it signs in as `signInAs`
+ * (a real Supabase user) unless `sessions` maps the ID token elsewhere.
  */
-export function buildApp(options: { grant?: VerifiedGrant; db?: SupabaseClient<Database>; box?: FakeMailbox } = {}): App {
+export function buildApp(
+  options: { grant?: VerifiedGrant; db?: SupabaseClient<Database>; box?: FakeMailbox; signInAs?: TestUser } = {},
+): App {
   const db = options.db ?? admin();
   const box = options.box ?? createFakeMailbox();
   const { factory } = createFakeProviderFactory(box, options.grant ? { grant: options.grant } : {});
+  const sessions = new FakeSessions(
+    options.signInAs
+      ? { userId: options.signInAs.userId, email: options.signInAs.email }
+      : { userId: '00000000-0000-0000-0000-000000000000', email: null },
+  );
   const pending: Array<Promise<unknown>> = [];
   const deps: AppDeps = {
     factory,
     ...createDb(db, ENCRYPTION_KEY),
+    sessions,
     jwtSecret: TEST_JWT_SECRET,
     supabaseUrl: liveConfig().url,
     frontendUrl: FRONTEND_URL,
@@ -150,11 +163,11 @@ export function buildApp(options: { grant?: VerifiedGrant; db?: SupabaseClient<D
     now: () => new Date(),
     log: () => undefined,
   };
-  return { handlers: createHandlers(() => deps), deps, box, pending };
+  return { handlers: createHandlers(() => deps), deps, box, sessions, pending };
 }
 
 /** The same app on a client with an invalid key: every DB call fails for real, giving `INTERNAL`. */
-export function buildBrokenDbApp(options: { grant?: VerifiedGrant; box?: FakeMailbox } = {}): App {
+export function buildBrokenDbApp(options: { grant?: VerifiedGrant; box?: FakeMailbox; signInAs?: TestUser } = {}): App {
   const { url } = liveConfig();
   const broken = createClient<Database>(url, 'invalid-service-role-key', { auth: { persistSession: false } });
   return buildApp({ ...options, db: broken });
@@ -218,8 +231,10 @@ export async function envelope(response: Response): Promise<{
 }
 
 export const req = {
-  get: (p: string, token?: string): Request =>
-    new Request(`https://api.vibemail.test${p}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} }),
+  get: (p: string, token?: string, cookie?: string): Request =>
+    new Request(`https://api.vibemail.test${p}`, {
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(cookie ? { Cookie: cookie } : {}) },
+    }),
   post: (p: string, body: unknown, token?: string, headers: Record<string, string> = {}): Request =>
     new Request(`https://api.vibemail.test${p}`, {
       method: 'POST',

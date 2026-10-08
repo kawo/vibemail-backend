@@ -1,13 +1,20 @@
 import { renewWatches, verifyCronSecret } from '../cron/renewWatch';
 import { ApiError } from '../middleware/errors';
 import { requireUser } from '../middleware/auth';
-import { issueState, verifyState } from '../middleware/oauthState';
+import {
+  STATE_COOKIE,
+  clearStateCookie,
+  readCookie,
+  stateCookie,
+  verifyState,
+  verifyStateCookie,
+} from '../middleware/oauthState';
 import { toMessageDTO } from '../messages/dto';
 import { listMessages, parseListQuery } from '../messages/list';
 import { markMessageRead } from '../messages/markRead';
-import { CONSENT_SCOPES, initiateOAuth } from '../providers/gmail/auth';
+import { initiateOAuth } from '../providers/gmail/auth';
 import { sendForUser } from '../send';
-import { connectGmailAccount } from '../services/gmailAccount';
+import { signInWithGoogle } from '../services/gmailAccount';
 import { handleGmailPush } from '../webhook/gmail';
 import type { AppDeps } from './deps';
 import { corsHeaders, errorResponse, jsonResponse, preflightResponse, toApiError, toOAuthApiError } from './respond';
@@ -22,8 +29,8 @@ type Handler = (request: Request) => Promise<Response>;
 
 export interface Handlers {
   options: Handler;
-  startConnect: Handler;
-  redirectConnect: Handler;
+  /** `GET /api/v1/auth/google`: 302 to Google sign-in (CONTRACT.md §4.1a). */
+  startSignIn: Handler;
   oauthCallback: Handler;
   /** Any non-GET method on the OAuth endpoints (CONTRACT.md §4.1). */
   oauthMethodNotAllowed: Handler;
@@ -80,33 +87,22 @@ export function createHandlers(getDeps: () => AppDeps): Handlers {
       return preflightResponse(frontendUrl);
     },
 
-    startConnect: authenticated(async (deps, user) => {
-      const { state, expiresAt } = issueState({ sub: user.userId, email: user.email }, deps.jwtSecret, deps.now());
-      const authorizationUrl = deps.factory.buildAuthorizationUrl({
-        state,
-        scopes: CONSENT_SCOPES,
-        loginHint: user.email,
-      });
-      return jsonResponse({ authorizationUrl, expiresAt: expiresAt.toISOString() }, 200);
-    }),
-
-    async redirectConnect(request) {
+    async startSignIn(request) {
       if (request.method !== 'GET') {
         return methodNotAllowed();
       }
-      let cors: Record<string, string> = {};
       try {
         const deps = getDeps();
-        cors = corsHeaders(deps.frontendUrl);
-        const user = requireUser(request, { jwtSecret: deps.jwtSecret, supabaseUrl: deps.supabaseUrl });
-        const { url } = initiateOAuth({ sub: user.userId, email: user.email }, { now: deps.now() });
-        return new Response(null, { status: 302, headers: { ...cors, Location: url, 'Cache-Control': 'no-store' } });
+        const { url, nonce } = initiateOAuth({ now: deps.now() });
+        const headers = new Headers({ Location: url, 'Cache-Control': 'no-store' });
+        headers.append('Set-Cookie', stateCookie(nonce));
+        return new Response(null, { status: 302, headers });
       } catch (error) {
         const apiError = toOAuthApiError(error);
         if (apiError.code === 'INTERNAL' || apiError.code === 'CONFIG_ERROR') {
-          console.error('OAuth start failed', error instanceof Error ? error.message : error);
+          console.error('Google sign-in start failed', error instanceof Error ? error.message : error);
         }
-        return errorResponse(apiError, cors);
+        return errorResponse(apiError);
       }
     },
 
@@ -126,17 +122,24 @@ export function createHandlers(getDeps: () => AppDeps): Handlers {
         console.error('OAuth callback failed', error instanceof Error ? error.message : error);
         return errorResponse(apiError);
       }
-      const target = new URL('/settings/gmail', deps.frontendUrl);
-      const redirect = (params: Record<string, string>): Response => {
+      const target = new URL('/auth/callback', deps.frontendUrl);
+      /** Status in the query; session tokens only in the fragment, which never reaches a server or log. */
+      const redirect = (params: Record<string, string>, fragment?: Record<string, string>): Response => {
         for (const [name, value] of Object.entries(params)) {
           target.searchParams.set(name, value);
         }
-        return new Response(null, { status: 302, headers: { Location: target.toString(), 'Cache-Control': 'no-store' } });
+        if (fragment) {
+          target.hash = new URLSearchParams(fragment).toString();
+        }
+        const headers = new Headers({ Location: target.toString(), 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+        headers.append('Set-Cookie', clearStateCookie());
+        return new Response(null, { status: 302, headers });
       };
 
       try {
         const query = new URL(request.url).searchParams;
         const state = verifyState(query.get('state'), deps.jwtSecret, deps.now());
+        verifyStateCookie(state, readCookie(request, STATE_COOKIE));
         const googleError = query.get('error');
         if (googleError) {
           throw new ApiError('GMAIL_NOT_CONNECTED', 'Google consent was not granted', {
@@ -147,11 +150,21 @@ export function createHandlers(getDeps: () => AppDeps): Handlers {
         if (!code) {
           throw new ApiError('VALIDATION_FAILED', 'missing authorization code');
         }
-        const result = await connectGmailAccount(
-          { factory: deps.factory, users: deps.users, messages: deps.messages, log: deps.log },
-          { userId: state.sub, expectedEmail: state.email, code },
+        const result = await signInWithGoogle(
+          { factory: deps.factory, users: deps.users, messages: deps.messages, sessions: deps.sessions, log: deps.log },
+          { code },
         );
-        return redirect({ status: 'connected', initialSync: result.initialSync });
+        const { session } = result;
+        return redirect(
+          { status: 'signed_in', initialSync: result.initialSync },
+          {
+            access_token: session.accessToken,
+            refresh_token: session.refreshToken,
+            expires_in: String(session.expiresIn),
+            expires_at: String(session.expiresAt),
+            token_type: 'bearer',
+          },
+        );
       } catch (error) {
         const apiError = toApiError(error);
         if (apiError.code === 'INTERNAL') {

@@ -220,6 +220,7 @@ export function createFakeProviderFactory(
         accountId: 'google-sub-1',
         email: 'me@example.com',
         name: 'Me Example',
+        idToken: 'id-token-google-sub-1',
         scopes: ['gmail.modify', 'gmail.send', 'email'],
         credentials: {
           refreshToken,

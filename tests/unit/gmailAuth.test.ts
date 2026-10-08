@@ -133,6 +133,7 @@ describe('verifyRefreshToken', () => {
       accountId: 'google-123',
       email: 'me@example.com',
       name: null,
+      idToken: null,
       scopes: [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE],
       credentials: { refreshToken: 'given-refresh', accessToken: 'fresh', accessTokenExpiresAt: new Date(later) },
     });
@@ -177,6 +178,7 @@ describe('exchangeAuthorizationCode', () => {
       accountId: 'google-123',
       email: 'me@example.com',
       name: 'Ada Lovelace',
+      idToken: idToken({ sub: 'google-123', email: 'me@example.com', name: 'Ada Lovelace' }),
       scopes: [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE],
       credentials: { refreshToken: 'refresh-1', accessToken: 'access-1', accessTokenExpiresAt: new Date(later) },
     });
@@ -208,8 +210,12 @@ describe('initiateOAuth', () => {
       GOOGLE_CLIENT_SECRET: 'client-secret',
       GOOGLE_REDIRECT_URI: config.redirectUri,
     };
-    const { url } = initiateOAuth({ sub: 'user-1', email: 'me@example.com' }, { env });
-    expect(new URL(url).searchParams.get('scope')?.split(' ')).toEqual([
+    const { url, state, nonce } = initiateOAuth({ env });
+    const query = new URL(url).searchParams;
+    expect(query.get('state')).toBe(state);
+    expect(query.get('login_hint')).toBeNull();
+    expect(Buffer.from(state.split('.')[0] ?? '', 'base64url').toString()).toContain(nonce);
+    expect(query.get('scope')?.split(' ')).toEqual([
       'openid',
       USERINFO_EMAIL_SCOPE,
       USERINFO_PROFILE_SCOPE,

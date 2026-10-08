@@ -12,6 +12,7 @@ import {
   ProviderError,
 } from '../providers/provider';
 import { REQUIRED_GMAIL_SCOPES } from '../providers/gmail/auth';
+import { type AuthSession, type SessionIssuer, SessionError } from './supabaseSession';
 
 export interface GmailAccountDeps {
   factory: MailProviderFactory;
@@ -20,19 +21,16 @@ export interface GmailAccountDeps {
   log?: (message: string, error: unknown) => void;
 }
 
-export interface ConnectInput {
-  /** `sub` from the verified OAuth `state` (CONTRACT.md §4.1b). */
-  userId: string;
-  /** `email` from the verified OAuth `state`; the Google account must match it. */
-  expectedEmail: string;
-  /** Google's authorization code from the callback. */
-  code: string;
+export interface SignInDeps extends GmailAccountDeps {
+  sessions: SessionIssuer;
 }
 
-export interface ConnectResult {
+export interface SignInResult {
+  /** The Supabase session for the signed-in user, handed to the frontend. */
+  session: AuthSession;
   email: string;
   scopes: string[];
-  /** Null when `watch()` failed; the failure is logged, not returned (CONTRACT.md §4.1 step 7). */
+  /** Null when `watch()` failed; the failure is logged, not returned (CONTRACT.md §4.1b step 7). */
   watchExpiration: Date | null;
   /** Step 8. On failure `history_id` stays null, so the next push notification runs the full sync. */
   initialSync: 'completed' | 'failed';
@@ -61,7 +59,7 @@ export function persistTokensFor(users: UsersRepository, userId: string): OnToke
   return (update: TokenUpdate) => users.updateUserTokens(userId, update);
 }
 
-function checkGrant(grant: VerifiedGrant, expectedEmail: string): { googleId: string; email: string } {
+function checkGrant(grant: VerifiedGrant): { googleId: string; email: string; idToken: string } {
   if (!grant.credentials.refreshToken) {
     throw new ApiError('GMAIL_NOT_CONNECTED', 'Google returned no refresh token', {
       details: { reason: 'no_refresh_token' },
@@ -72,9 +70,9 @@ function checkGrant(grant: VerifiedGrant, expectedEmail: string): { googleId: st
       details: { reason: 'missing_email_scope', missingScopes: ['email'] },
     });
   }
-  if (grant.email.toLowerCase() !== expectedEmail.toLowerCase()) {
-    throw new ApiError('VALIDATION_FAILED', 'The Google account does not match the signed-in user', {
-      details: { reason: 'EMAIL_MISMATCH' },
+  if (!grant.idToken) {
+    throw new ApiError('GMAIL_NOT_CONNECTED', 'Google returned no ID token', {
+      details: { reason: 'missing_openid_scope', missingScopes: ['openid'] },
     });
   }
   const missingScopes = REQUIRED_GMAIL_SCOPES.filter((scope) => !grant.scopes.includes(scope));
@@ -83,15 +81,16 @@ function checkGrant(grant: VerifiedGrant, expectedEmail: string): { googleId: st
       details: { reason: 'missing_gmail_scope', missingScopes },
     });
   }
-  return { googleId: grant.accountId, email: grant.email };
+  return { googleId: grant.accountId, email: grant.email, idToken: grant.idToken };
 }
 
 /**
- * Connect Gmail, CONTRACT.md §4.1b steps 3–8: exchange the authorization code, check identity
- * and scopes, store encrypted tokens (upsert on `google_id`), register the push watch, then run
- * the initial full sync. Watch and sync failures are logged and never fail the connect.
+ * Google sign-in, CONTRACT.md §4.1b steps 3–8: exchange the authorization code, check identity
+ * and scopes, sign in to Supabase with the ID token (creating the user on first sign-in), store
+ * encrypted Gmail tokens (upsert on `google_id`), register the push watch, then run the initial
+ * full sync. Watch and sync failures are logged and never fail the sign-in.
  */
-export async function connectGmailAccount(deps: GmailAccountDeps, input: ConnectInput): Promise<ConnectResult> {
+export async function signInWithGoogle(deps: SignInDeps, input: { code: string }): Promise<SignInResult> {
   const log = deps.log ?? defaultLog;
 
   let grant: VerifiedGrant;
@@ -100,11 +99,29 @@ export async function connectGmailAccount(deps: GmailAccountDeps, input: Connect
   } catch (error) {
     throw error instanceof ProviderError ? apiErrorFromProvider(error) : error;
   }
-  const { googleId, email } = checkGrant(grant, input.expectedEmail);
+  const { googleId, email, idToken } = checkGrant(grant);
+
+  let session: AuthSession;
+  try {
+    session = await deps.sessions.signInWithGoogleIdToken({ idToken, accessToken: grant.credentials.accessToken });
+  } catch (error) {
+    if (error instanceof SessionError) {
+      log('Supabase sign-in failed', error);
+      throw new ApiError('INTERNAL', 'Sign-in failed', { details: { reason: 'SUPABASE_SIGN_IN_FAILED' } });
+    }
+    throw error;
+  }
+  // Both come from the same Google account; a mismatch means a broken provider setup.
+  if (session.email && session.email.toLowerCase() !== email.toLowerCase()) {
+    throw new ApiError('VALIDATION_FAILED', 'The Google account does not match the Supabase user', {
+      details: { reason: 'EMAIL_MISMATCH' },
+    });
+  }
+  const userId = session.userId;
 
   const outcome = await deps.users.upsertConnectedUser({
     googleId,
-    userId: input.userId,
+    userId,
     email,
     name: grant.name,
     scopes: grant.scopes,
@@ -121,29 +138,26 @@ export async function connectGmailAccount(deps: GmailAccountDeps, input: Connect
     });
   }
 
-  const provider = deps.factory.forAccount(grant.credentials, persistTokensFor(deps.users, input.userId));
+  const provider = deps.factory.forAccount(grant.credentials, persistTokensFor(deps.users, userId));
 
   let watchExpiration: Date | null = null;
   try {
     const watch = await provider.watch();
-    await deps.users.updateWatchExpiry(input.userId, watch.expiresAt);
+    await deps.users.updateWatchExpiry(userId, watch.expiresAt);
     watchExpiration = watch.expiresAt;
   } catch (error) {
-    log('watch registration failed after connect', error);
+    log('watch registration failed after sign-in', error);
   }
 
-  let initialSync: ConnectResult['initialSync'] = 'completed';
+  let initialSync: SignInResult['initialSync'] = 'completed';
   try {
-    await runInitialSync(
-      { provider, factory: deps.factory, messages: deps.messages, users: deps.users },
-      input.userId,
-    );
+    await runInitialSync({ provider, factory: deps.factory, messages: deps.messages, users: deps.users }, userId);
   } catch (error) {
     initialSync = 'failed';
-    log('initial sync failed after connect', error);
+    log('initial sync failed after sign-in', error);
   }
 
-  return { email, scopes: grant.scopes, watchExpiration, initialSync };
+  return { session, email, scopes: grant.scopes, watchExpiration, initialSync };
 }
 
 /**

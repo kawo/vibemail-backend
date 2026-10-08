@@ -214,6 +214,7 @@ async function grantFromClient(
     accountId: info.sub ?? null,
     email: info.email ?? null,
     name: nameFromIdToken(idToken),
+    idToken: idToken ?? null,
     scopes: info.scopes,
     // Empty when Google returned none (consent without access_type=offline / prompt=consent).
     // Callers reject that as GMAIL_NOT_CONNECTED (CONTRACT.md §4.1b step 3).
@@ -249,13 +250,13 @@ export function buildAuthorizationUrl(
 }
 
 /**
- * Starts the redirect OAuth flow (CONTRACT.md §4.1c): signs a `state` for the user and builds the
- * consent URL. Reads its configuration from env and throws `MissingEnvError` when any is missing.
+ * Starts Google sign-in (CONTRACT.md §4.1a): signs a `state` and builds the consent URL. The
+ * caller sets `nonce` in the state cookie. Reads its configuration from env and throws
+ * `MissingEnvError` when any is missing.
  */
 export function initiateOAuth(
-  user: { sub: string; email: string },
   options: { env?: NodeJS.ProcessEnv; now?: Date } = {},
-): { url: string; state: string; expiresAt: Date } {
+): { url: string; state: string; nonce: string; expiresAt: Date } {
   const env = options.env ?? process.env;
   const stateSecret = requireEnv('JWT_SECRET', env);
   const config: GmailAuthConfig = {
@@ -265,9 +266,9 @@ export function initiateOAuth(
     // Not needed to build a consent URL.
     pubsubTopic: env.GOOGLE_PUBSUB_TOPIC ?? '',
   };
-  const { state, expiresAt } = issueState(user, stateSecret, options.now);
-  const url = buildAuthorizationUrl(config, { state, scopes: CONSENT_SCOPES, loginHint: user.email });
-  return { url, state, expiresAt };
+  const { state, nonce, expiresAt } = issueState(stateSecret, options.now);
+  const url = buildAuthorizationUrl(config, { state, scopes: CONSENT_SCOPES });
+  return { url, state, nonce, expiresAt };
 }
 
 /** Exchanges an authorization code for tokens, then reads identity and scopes (CONTRACT.md §4.1b). */

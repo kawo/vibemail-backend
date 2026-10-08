@@ -2,9 +2,10 @@ import jwt from 'jsonwebtoken';
 import { MissingEnvError } from '../../src/config/env';
 import type { AppDeps } from '../../src/http/deps';
 import { createHandlers } from '../../src/http/handlers';
-import { issueState } from '../../src/middleware/oauthState';
+import { STATE_COOKIE, issueState } from '../../src/middleware/oauthState';
 import { toMessageRow } from '../../src/db/messages';
 import { createFakeProviderFactory, fakeMessage } from '../fakes/fakeProvider';
+import { FakeSessions, SessionError } from '../fakes/fakeSessions';
 import { MemoryMessages, MemoryUsers } from '../fakes/memoryRepos';
 
 const SECRET = 'test-jwt-secret-at-least-32-characters!!';
@@ -30,6 +31,7 @@ function setup(connected = true) {
       accountId: 'google-1',
       email: EMAIL,
       name: 'Me Example',
+      idToken: 'id-token-1',
       scopes: ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/gmail.send'],
       credentials: { refreshToken: 'r', accessToken: 'a', accessTokenExpiresAt: new Date(Date.now() + 3600_000) },
     },
@@ -47,11 +49,13 @@ function setup(connected = true) {
     });
   }
   const messages = new MemoryMessages();
+  const sessions = new FakeSessions({ userId: USER, email: EMAIL });
   const pending: Array<Promise<unknown>> = [];
   const deps: AppDeps = {
     factory,
     users,
     messages,
+    sessions,
     jwtSecret: SECRET,
     supabaseUrl: SUPABASE,
     frontendUrl: FRONTEND,
@@ -67,12 +71,12 @@ function setup(connected = true) {
     messages.upsertMessages(USER, [
       toMessageRow(USER, fakeMessage({ id, labels, receivedAt: new Date(Date.UTC(2026, 9, 1, 0, minute)) }), now),
     ]);
-  return { h: createHandlers(() => deps), deps, box, users, messages, store, pending };
+  return { h: createHandlers(() => deps), deps, box, users, messages, sessions, store, pending };
 }
 
-const get = (path: string, token?: string) =>
+const get = (path: string, token?: string, cookie?: string) =>
   new Request(`https://api.vibemail.test${path}`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(cookie ? { Cookie: cookie } : {}) },
   });
 const post = (path: string, body: unknown, token?: string) =>
   new Request(`https://api.vibemail.test${path}`, {
@@ -105,36 +109,24 @@ describe('JWT middleware on bearer-protected routes (CONTRACT.md §3.1)', () => 
     });
   });
 
-  it('applies to start, send and read too', async () => {
+  it('applies to send and read too', async () => {
     const { h } = setup();
     const responses = await Promise.all([
-      h.startConnect(get('/api/v1/auth/google/start')),
       h.sendMessage(post('/api/v1/messages/send', { to: 'a@x.io', subject: 's', body: 'b' })),
       h.markRead(post('/api/v1/messages/m1/read', {})),
     ]);
-    expect(responses.map((r) => r.status)).toEqual([401, 401, 401]);
+    expect(responses.map((r) => r.status)).toEqual([401, 401]);
   });
 });
 
-describe('GET /api/v1/auth/google/start (§4.1a)', () => {
-  it('returns a consent URL carrying a signed state', async () => {
-    const { h } = setup(false);
-    const response = await h.startConnect(get('/api/v1/auth/google/start', bearer()));
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as { authorizationUrl: string; expiresAt: string };
-    const state = new URL(body.authorizationUrl).searchParams.get('state') ?? '';
-    expect(state.split('.')).toHaveLength(2);
-    expect(body.expiresAt).toBe('2026-10-06T10:10:00.000Z');
-  });
-});
+const OAUTH_ENV = {
+  JWT_SECRET: SECRET,
+  GOOGLE_CLIENT_ID: 'client-id.apps.googleusercontent.com',
+  GOOGLE_CLIENT_SECRET: 'client-secret',
+  GOOGLE_REDIRECT_URI: 'https://api.vibemail.test/api/v1/auth/google/callback',
+};
 
-describe('GET /api/v1/auth/google (§4.1c)', () => {
-  const OAUTH_ENV = {
-    JWT_SECRET: SECRET,
-    GOOGLE_CLIENT_ID: 'client-id.apps.googleusercontent.com',
-    GOOGLE_CLIENT_SECRET: 'client-secret',
-    GOOGLE_REDIRECT_URI: 'https://api.vibemail.test/api/v1/auth/google/callback',
-  };
+describe('GET /api/v1/auth/google (§4.1a)', () => {
   let saved: NodeJS.ProcessEnv;
   beforeEach(() => {
     saved = { ...process.env };
@@ -144,29 +136,28 @@ describe('GET /api/v1/auth/google (§4.1c)', () => {
     process.env = saved;
   });
 
-  it('302s to Google with a state the callback accepts', async () => {
-    const { h } = setup(false);
-    const response = await h.redirectConnect(get('/api/v1/auth/google', bearer()));
+  it('needs no bearer: sets the state cookie and 302s to Google, and the callback signs the user in', async () => {
+    const { h, users } = setup(false);
+    const response = await h.startSignIn(get('/api/v1/auth/google'));
     expect(response.status).toBe(302);
     expect(response.headers.get('cache-control')).toBe('no-store');
     const target = new URL(response.headers.get('location') ?? '');
     expect(target.origin).toBe('https://accounts.google.com');
     expect(target.searchParams.get('client_id')).toBe(OAUTH_ENV.GOOGLE_CLIENT_ID);
     expect(target.searchParams.get('redirect_uri')).toBe(OAUTH_ENV.GOOGLE_REDIRECT_URI);
-    expect(target.searchParams.get('login_hint')).toBe(EMAIL);
     expect(target.searchParams.get('access_type')).toBe('offline');
 
-    const state = target.searchParams.get('state') ?? '';
-    const callback = await h.oauthCallback(get(`/api/v1/auth/google/callback?${new URLSearchParams({ code: 'c', state }).toString()}`));
-    expect(new URL(callback.headers.get('location') ?? '').searchParams.get('status')).toBe('connected');
-  });
+    const setCookie = response.headers.get('set-cookie') ?? '';
+    expect(setCookie).toMatch(new RegExp(`^${STATE_COOKIE}=[\\w-]+; Path=/api/v1/auth/google; Max-Age=600; HttpOnly; Secure; SameSite=Lax$`));
+    const cookie = setCookie.split(';')[0] ?? '';
 
-  it('rejects a missing bearer with the 401 envelope, not a redirect', async () => {
-    const { h } = setup(false);
-    const response = await h.redirectConnect(get('/api/v1/auth/google'));
-    expect(response.status).toBe(401);
-    expect(response.headers.get('location')).toBeNull();
-    await expect(envelope(response)).resolves.toMatchObject({ error: { code: 'UNAUTHENTICATED' } });
+    const state = target.searchParams.get('state') ?? '';
+    const callback = await h.oauthCallback(
+      get(`/api/v1/auth/google/callback?${new URLSearchParams({ code: 'c', state }).toString()}`, undefined, cookie),
+    );
+    const landing = new URL(callback.headers.get('location') ?? '');
+    expect(landing.searchParams.get('status')).toBe('signed_in');
+    expect(users.rows.get(USER)?.googleId).toBe('google-1');
   });
 
   it.each(['JWT_SECRET', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI'])(
@@ -174,8 +165,9 @@ describe('GET /api/v1/auth/google (§4.1c)', () => {
     async (variable) => {
       delete process.env[variable];
       const { h } = setup(false);
-      const response = await h.redirectConnect(get('/api/v1/auth/google', bearer()));
+      const response = await h.startSignIn(get('/api/v1/auth/google'));
       expect(response.status).toBe(500);
+      expect(response.headers.get('set-cookie')).toBeNull();
       await expect(envelope(response)).resolves.toEqual({
         error: { code: 'CONFIG_ERROR', message: 'server is not configured', retryable: false },
       });
@@ -186,7 +178,7 @@ describe('GET /api/v1/auth/google (§4.1c)', () => {
     const h = createHandlers(() => {
       throw new MissingEnvError('SUPABASE_URL');
     });
-    const response = await h.redirectConnect(get('/api/v1/auth/google', bearer()));
+    const response = await h.startSignIn(get('/api/v1/auth/google'));
     expect(response.status).toBe(500);
     await expect(envelope(response)).resolves.toMatchObject({ error: { code: 'CONFIG_ERROR' } });
   });
@@ -199,7 +191,7 @@ describe('non-GET methods on the OAuth endpoints (§4.1)', () => {
     const request = (path: string) => new Request(`https://api.vibemail.test${path}`, { method });
     for (const response of [
       await h.oauthMethodNotAllowed(request('/api/v1/auth/google')),
-      await h.redirectConnect(request('/api/v1/auth/google')),
+      await h.startSignIn(request('/api/v1/auth/google')),
       await h.oauthCallback(request('/api/v1/auth/google/callback')),
     ]) {
       expect(response.status).toBe(405);
@@ -222,34 +214,63 @@ describe('GET /api/v1/auth/google/callback (§4.1b)', () => {
     await expect(envelope(response)).resolves.toMatchObject({ error: { code: 'CONFIG_ERROR' } });
   });
 
-
-  const callback = (params: Record<string, string>) =>
-    get(`/api/v1/auth/google/callback?${new URLSearchParams(params).toString()}`);
+  /** A state plus the matching browser cookie, as `GET /api/v1/auth/google` would have set. */
+  const started = (at: Date = now) => {
+    const { state, nonce } = issueState(SECRET, at);
+    return { state, cookie: `${STATE_COOKIE}=${nonce}` };
+  };
+  const callback = (params: Record<string, string>, cookie?: string) =>
+    get(`/api/v1/auth/google/callback?${new URLSearchParams(params).toString()}`, undefined, cookie);
   const location = (response: Response) => new URL(response.headers.get('location') ?? '');
 
-  it('connects, then redirects to the frontend', async () => {
-    const { h, users } = setup(false);
-    const { state } = issueState({ sub: USER, email: EMAIL }, SECRET, now);
-    const response = await h.oauthCallback(callback({ code: 'c', state }));
+  it('signs in, stores the Gmail account, and hands the session over in the fragment only', async () => {
+    const { h, users, sessions } = setup(false);
+    const { state, cookie } = started();
+    const response = await h.oauthCallback(callback({ code: 'c', state }, cookie));
     expect(response.status).toBe(302);
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(response.headers.get('set-cookie')).toContain(`${STATE_COOKIE}=; Path=/api/v1/auth/google; Max-Age=0`);
     const target = location(response);
-    expect(`${target.origin}${target.pathname}`).toBe(`${FRONTEND}/settings/gmail`);
-    expect(Object.fromEntries(target.searchParams)).toEqual({ status: 'connected', initialSync: 'completed' });
-    expect(users.rows.get(USER)?.googleId).toBe('google-1');
+    expect(`${target.origin}${target.pathname}`).toBe(`${FRONTEND}/auth/callback`);
+    expect(Object.fromEntries(target.searchParams)).toEqual({ status: 'signed_in', initialSync: 'completed' });
+    expect(Object.fromEntries(new URLSearchParams(target.hash.slice(1)))).toEqual({
+      access_token: `sb-access-${USER}`,
+      refresh_token: `sb-refresh-${USER}`,
+      expires_in: '3600',
+      expires_at: '1791000000',
+      token_type: 'bearer',
+    });
+    expect(sessions.calls).toEqual([{ idToken: 'id-token-1', accessToken: 'a' }]);
+    expect(users.rows.get(USER)).toMatchObject({ googleId: 'google-1', email: EMAIL, name: 'Me Example' });
   });
 
   it.each([
-    ['tampered state', () => ({ code: 'c', state: `${issueState({ sub: USER, email: EMAIL }, SECRET, now).state}x` }), 'UNAUTHENTICATED', undefined],
-    ['expired state', () => ({ code: 'c', state: issueState({ sub: USER, email: EMAIL }, SECRET, new Date(now.getTime() - 11 * 60_000)).state }), 'UNAUTHENTICATED', undefined],
-    ['consent denied', () => ({ error: 'access_denied', state: issueState({ sub: USER, email: EMAIL }, SECRET, now).state }), 'GMAIL_NOT_CONNECTED', 'access_denied'],
-    ['missing code', () => ({ state: issueState({ sub: USER, email: EMAIL }, SECRET, now).state }), 'VALIDATION_FAILED', undefined],
-    ['email mismatch', () => ({ code: 'c', state: issueState({ sub: USER, email: 'attacker@example.com' }, SECRET, now).state }), 'VALIDATION_FAILED', 'EMAIL_MISMATCH'],
-  ])('redirects with an error for %s, writing nothing', async (_name, params, code, reason) => {
-    const { h, users } = setup(false);
-    const response = await h.oauthCallback(callback(params()));
+    ['tampered state', () => { const s = started(); return [{ code: 'c', state: `${s.state}x` }, s.cookie] as const; }, 'UNAUTHENTICATED', undefined],
+    ['expired state', () => { const s = started(new Date(now.getTime() - 11 * 60_000)); return [{ code: 'c', state: s.state }, s.cookie] as const; }, 'UNAUTHENTICATED', undefined],
+    ['missing state cookie', () => [{ code: 'c', state: started().state }, undefined] as const, 'UNAUTHENTICATED', undefined],
+    ['cookie from another flow', () => [{ code: 'c', state: started().state }, started().cookie] as const, 'UNAUTHENTICATED', undefined],
+    ['consent denied', () => { const s = started(); return [{ error: 'access_denied', state: s.state }, s.cookie] as const; }, 'GMAIL_NOT_CONNECTED', 'access_denied'],
+    ['missing code', () => { const s = started(); return [{ state: s.state }, s.cookie] as const; }, 'VALIDATION_FAILED', undefined],
+  ])('redirects with an error for %s, without a session or writes', async (_name, args, code, reason) => {
+    const { h, users, sessions } = setup(false);
+    const [params, cookie] = args();
+    const response = await h.oauthCallback(callback(params, cookie));
     expect(response.status).toBe(302);
-    const query = Object.fromEntries(location(response).searchParams);
-    expect(query).toEqual({ status: 'error', code, ...(reason ? { reason } : {}) });
+    const target = location(response);
+    expect(Object.fromEntries(target.searchParams)).toEqual({ status: 'error', code, ...(reason ? { reason } : {}) });
+    expect(target.hash).toBe('');
+    expect(response.headers.get('set-cookie')).toContain('Max-Age=0');
+    expect(sessions.calls).toEqual([]);
+    expect(users.rows.size).toBe(0);
+  });
+
+  it('redirects with INTERNAL SUPABASE_SIGN_IN_FAILED when Supabase rejects the ID token', async () => {
+    const { h, users, sessions } = setup(false);
+    sessions.fail = new SessionError('Supabase sign-in failed: Provider not enabled', null);
+    const { state, cookie } = started();
+    const target = location(await h.oauthCallback(callback({ code: 'c', state }, cookie)));
+    expect(Object.fromEntries(target.searchParams)).toEqual({ status: 'error', code: 'INTERNAL', reason: 'SUPABASE_SIGN_IN_FAILED' });
+    expect(target.hash).toBe('');
     expect(users.rows.size).toBe(0);
   });
 });

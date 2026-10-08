@@ -72,6 +72,8 @@ export interface VerifiedGrant {
   email: string | null;
   /** The account's display name, or null if the profile scope was not granted. */
   name: string | null;
+  /** The OpenID Connect ID token from the exchange, used to sign the user in (CONTRACT.md §4.1b), or null. */
+  idToken: string | null;
   scopes: string[];
   credentials: AccountCredentials;
 }
