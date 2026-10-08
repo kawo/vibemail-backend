@@ -70,6 +70,8 @@ export interface VerifiedGrant {
   accountId: string | null;
   /** The account's email, or null if the email scope was not granted. */
   email: string | null;
+  /** The account's display name, or null if the profile scope was not granted. */
+  name: string | null;
   scopes: string[];
   credentials: AccountCredentials;
 }

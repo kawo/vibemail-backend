@@ -1,10 +1,16 @@
 import { Auth } from 'googleapis';
 import {
   type GmailAuthConfig,
+  CONSENT_SCOPES,
   GMAIL_MODIFY_SCOPE,
   GMAIL_SEND_SCOPE,
+  USERINFO_EMAIL_SCOPE,
+  USERINFO_PROFILE_SCOPE,
   bindAccount,
   buildAuthorizationUrl,
+  exchangeAuthorizationCode,
+  initiateOAuth,
+  nameFromIdToken,
   refreshBoundAccessToken,
   toProviderError,
   toTokenUpdate,
@@ -126,6 +132,7 @@ describe('verifyRefreshToken', () => {
     await expect(verifyRefreshToken(config, 'given-refresh')).resolves.toEqual({
       accountId: 'google-123',
       email: 'me@example.com',
+      name: null,
       scopes: [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE],
       credentials: { refreshToken: 'given-refresh', accessToken: 'fresh', accessTokenExpiresAt: new Date(later) },
     });
@@ -140,6 +147,76 @@ describe('verifyRefreshToken', () => {
     expect(grant.credentials.refreshToken).toBe('rotated');
     expect(grant.email).toBeNull();
     expect(grant.accountId).toBeNull();
+  });
+});
+
+const idToken = (claims: Record<string, unknown>) =>
+  ['{"alg":"RS256"}', JSON.stringify(claims)].map((p) => Buffer.from(p).toString('base64url')).join('.') + '.sig';
+
+describe('exchangeAuthorizationCode', () => {
+  it('reads sub and email from token info and name from the id_token, with no profile call', async () => {
+    jest.spyOn(Auth.OAuth2Client.prototype, 'getToken').mockResolvedValue({
+      tokens: {
+        access_token: 'access-1',
+        expiry_date: later,
+        refresh_token: 'refresh-1',
+        id_token: idToken({ sub: 'google-123', email: 'me@example.com', name: 'Ada Lovelace' }),
+      },
+      res: null,
+    } as never);
+    const tokenInfo = jest.spyOn(Auth.OAuth2Client.prototype, 'getTokenInfo').mockResolvedValue({
+      aud: 'client-id',
+      scopes: [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE],
+      expiry_date: later,
+      sub: 'google-123',
+      email: 'me@example.com',
+    });
+    const request = jest.spyOn(Auth.OAuth2Client.prototype, 'request');
+
+    await expect(exchangeAuthorizationCode(config, 'code-1')).resolves.toEqual({
+      accountId: 'google-123',
+      email: 'me@example.com',
+      name: 'Ada Lovelace',
+      scopes: [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE],
+      credentials: { refreshToken: 'refresh-1', accessToken: 'access-1', accessTokenExpiresAt: new Date(later) },
+    });
+    expect(tokenInfo).toHaveBeenCalledWith('access-1');
+    expect(request).not.toHaveBeenCalled();
+  });
+});
+
+describe('nameFromIdToken', () => {
+  it.each([
+    [idToken({ name: 'Ada Lovelace' }), 'Ada Lovelace'],
+    [idToken({ name: '   ' }), null],
+    [idToken({ email: 'me@example.com' }), null],
+    [idToken({ name: 42 }), null],
+    ['not-a-jwt', null],
+    ['a.%%%.c', null],
+    [undefined, null],
+    [null, null],
+  ])('%j → %j', (token, expected) => {
+    expect(nameFromIdToken(token)).toBe(expected);
+  });
+});
+
+describe('initiateOAuth', () => {
+  it('requests the userinfo email and profile scopes alongside Gmail and openid', () => {
+    const env = {
+      JWT_SECRET: 'state-secret',
+      GOOGLE_CLIENT_ID: 'client-id',
+      GOOGLE_CLIENT_SECRET: 'client-secret',
+      GOOGLE_REDIRECT_URI: config.redirectUri,
+    };
+    const { url } = initiateOAuth({ sub: 'user-1', email: 'me@example.com' }, { env });
+    expect(new URL(url).searchParams.get('scope')?.split(' ')).toEqual([
+      'openid',
+      USERINFO_EMAIL_SCOPE,
+      USERINFO_PROFILE_SCOPE,
+      GMAIL_MODIFY_SCOPE,
+      GMAIL_SEND_SCOPE,
+    ]);
+    expect(CONSENT_SCOPES).toContain('https://www.googleapis.com/auth/userinfo.profile');
   });
 });
 

@@ -29,6 +29,7 @@ function setup(connected = true) {
     grant: {
       accountId: 'google-1',
       email: EMAIL,
+      name: 'Me Example',
       scopes: ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/gmail.send'],
       credentials: { refreshToken: 'r', accessToken: 'a', accessTokenExpiresAt: new Date(Date.now() + 3600_000) },
     },

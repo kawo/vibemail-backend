@@ -9,7 +9,8 @@ import type {
 import type { AccountCredentials, ProviderMessage, TokenUpdate } from '../../src/providers/provider';
 import type { UserRow } from '../../src/types';
 
-export interface MemoryUserRow extends ConnectedUserInput {
+export interface MemoryUserRow extends Omit<ConnectedUserInput, 'name'> {
+  name?: string | null;
   watch?: Date;
   historyId: string | null;
   lastSyncedAt: Date | null;
@@ -54,6 +55,7 @@ export class MemoryUsers implements UsersRepository {
       google_id: row.googleId,
       user_id: row.userId,
       email: row.email,
+      name: row.name ?? null,
       scopes: row.scopes,
       refresh_token: this.cleared.includes(userId) ? null : 'encrypted',
       access_token: null,

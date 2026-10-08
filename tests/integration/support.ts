@@ -108,6 +108,7 @@ export function grantFor(user: TestUser, overrides: Partial<VerifiedGrant> = {})
   return {
     accountId: user.googleId,
     email: user.email,
+    name: 'Test User',
     scopes: [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE],
     credentials: {
       refreshToken: `refresh-${user.userId}`,
@@ -170,6 +171,7 @@ export async function seedConnectedUser(
     googleId: user.googleId,
     userId: user.userId,
     email: user.email,
+    name: grant.name,
     scopes: grant.scopes,
     credentials: grant.credentials,
   });

@@ -106,6 +106,7 @@ export async function connectGmailAccount(deps: GmailAccountDeps, input: Connect
     googleId,
     userId: input.userId,
     email,
+    name: grant.name,
     scopes: grant.scopes,
     credentials: grant.credentials,
   });

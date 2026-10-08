@@ -20,6 +20,8 @@ export interface ConnectedUserInput {
   googleId: string;
   userId: string;
   email: string;
+  /** Google display name, or null when not disclosed. */
+  name: string | null;
   scopes: string[];
   credentials: AccountCredentials;
 }
@@ -142,6 +144,7 @@ export function createUsersRepository(db: SupabaseClient<Database>, key: Buffer)
           google_id: input.googleId,
           user_id: input.userId,
           email: input.email,
+          name: input.name,
           scopes: input.scopes,
           refresh_token: encryptToken(credentials.refreshToken, key),
           access_token: paired && credentials.accessToken ? encryptToken(credentials.accessToken, key) : null,

@@ -12,6 +12,7 @@ import { MemoryMessages, MemoryUsers } from '../fakes/memoryRepos';
 const goodGrant: VerifiedGrant = {
   accountId: 'google-123',
   email: 'Me@Example.com',
+  name: 'Me Example',
   scopes: [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE],
   credentials: { refreshToken: 'r', accessToken: 'a', accessTokenExpiresAt: new Date(Date.now() + 3600_000) },
 };
@@ -32,7 +33,13 @@ describe('connectGmailAccount (CONTRACT.md §4.1)', () => {
     expect(result.email).toBe('Me@Example.com');
     expect(result.watchExpiration).toBeInstanceOf(Date);
     const row = users.rows.get('user-1');
-    expect(row).toMatchObject({ googleId: 'google-123', userId: 'user-1', credentials: goodGrant.credentials });
+    expect(row).toMatchObject({
+      googleId: 'google-123',
+      userId: 'user-1',
+      email: 'Me@Example.com',
+      name: 'Me Example',
+      credentials: goodGrant.credentials,
+    });
     expect(row?.watch).toEqual(result.watchExpiration);
     expect(result.initialSync).toBe('completed');
     expect(box.calls.map((c) => c.method)).toEqual(['watch', 'listInboxMessageIds']);

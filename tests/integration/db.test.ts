@@ -67,7 +67,7 @@ describe('users operations', () => {
     const user = await createTestUser();
     await seedConnectedUser(buildApp(), user);
     const row = await db().users.getUser(user.userId);
-    expect(row).toMatchObject({ user_id: user.userId, google_id: user.googleId, email: user.email });
+    expect(row).toMatchObject({ user_id: user.userId, google_id: user.googleId, email: user.email, name: 'Test User' });
     expect(row?.refresh_token).toMatch(/^v1:/);
     await expect(db().users.getUser('00000000-0000-0000-0000-000000000000')).resolves.toBeNull();
   });

@@ -20,8 +20,13 @@ export const GMAIL_MODIFY_SCOPE = 'https://www.googleapis.com/auth/gmail.modify'
 export const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
 /** The two Gmail scopes token info must report. `email` is checked through token info's `email`/`sub`. */
 export const REQUIRED_GMAIL_SCOPES = [GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE] as const;
-/** Scopes for a consent URL: Gmail plus identity (CONTRACT.md §3.1). */
-export const CONSENT_SCOPES = ['openid', 'email', ...REQUIRED_GMAIL_SCOPES];
+export const USERINFO_EMAIL_SCOPE = 'https://www.googleapis.com/auth/userinfo.email';
+export const USERINFO_PROFILE_SCOPE = 'https://www.googleapis.com/auth/userinfo.profile';
+/**
+ * Scopes for a consent URL: Gmail plus identity (CONTRACT.md §3.1). `openid` makes the code
+ * exchange return an id_token; `userinfo.profile` puts the `name` claim in it.
+ */
+export const CONSENT_SCOPES = ['openid', USERINFO_EMAIL_SCOPE, USERINFO_PROFILE_SCOPE, ...REQUIRED_GMAIL_SCOPES];
 
 export interface GmailAuthConfig {
   clientId: string;
@@ -167,11 +172,39 @@ export function toProviderError(error: unknown, context: string): ProviderError 
   return new ProviderError('upstream', `${context}: Google request failed`, { cause: error });
 }
 
+/**
+ * The `name` claim of an id_token, or null. The token comes straight from Google's token
+ * endpoint over TLS, so its claims are read without a signature check (OpenID Connect Core
+ * §3.1.3.7) and without a separate userinfo call.
+ */
+export function nameFromIdToken(idToken: string | null | undefined): string | null {
+  const payload = idToken?.split('.')[1];
+  if (!payload) {
+    return null;
+  }
+  try {
+    const claims: unknown = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    const name = typeof claims === 'object' && claims !== null ? (claims as { name?: unknown }).name : undefined;
+    return typeof name === 'string' && name.trim() !== '' ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Identity comes from token info (`sub` → `google_id`, `email`) plus the id_token's `name`.
+ * No profile API call is made.
+ */
 async function grantFromClient(
   client: Auth.OAuth2Client,
   fallbackRefreshToken: string | null,
 ): Promise<VerifiedGrant> {
-  const { access_token: accessToken, expiry_date: expiryDate, refresh_token: rotated } = client.credentials;
+  const {
+    access_token: accessToken,
+    expiry_date: expiryDate,
+    refresh_token: rotated,
+    id_token: idToken,
+  } = client.credentials;
   const refreshToken = rotated ?? fallbackRefreshToken;
   if (!accessToken || !expiryDate) {
     throw new ProviderError('upstream', 'Google returned no access token');
@@ -180,6 +213,7 @@ async function grantFromClient(
   return {
     accountId: info.sub ?? null,
     email: info.email ?? null,
+    name: nameFromIdToken(idToken),
     scopes: info.scopes,
     // Empty when Google returned none (consent without access_type=offline / prompt=consent).
     // Callers reject that as GMAIL_NOT_CONNECTED (CONTRACT.md §4.1b step 3).
