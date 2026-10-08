@@ -87,7 +87,10 @@ The project is complete when **every** item below is true and verifiable.
   - **Paired columns.** `access_token` and `access_token_expires_at` are always written together, or both set to `null`. `google-auth-library` treats a credential with no `expiry_date` as *never expiring*, so an access token stored without an expiry would never be refreshed. A DB `CHECK` enforces the pairing (§5.2).
   - **Revocation.** On `invalid_grant`, both access-token columns are set to `null`.
 - **Gmail grant: backend OAuth.** The backend runs Google's authorization-code flow itself (§4.1): consent URL → `GET /api/v1/auth/google/callback` → code exchange. Supabase is used only for the user's own sign-in, not for Gmail tokens.
-- Required Google scopes: `openid`, `email`, `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/gmail.send`. The consent URL uses `access_type=offline` and `prompt=consent`, so that Google returns a refresh token. Google's token info returns the account's `email` and `sub` only when the `email` scope was granted.
+- Required Google scopes: `openid`, `https://www.googleapis.com/auth/userinfo.email`, `https://www.googleapis.com/auth/userinfo.profile`, `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/gmail.send`. The consent URL uses `access_type=offline` and `prompt=consent`, so that Google returns a refresh token.
+  - Google's token info returns the account's `email` and `sub` only when `userinfo.email` was granted.
+  - `openid` makes the code exchange return an `id_token`. With `userinfo.profile`, that token carries the account's `name`.
+  - No separate profile or userinfo API call is made.
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` configure every `OAuth2Client`.
   - The client is always constructed with the options object, `new OAuth2Client({ clientId, clientSecret, redirectUri })`, because the positional-argument form is deprecated in `google-auth-library` 11.
   - `GOOGLE_REDIRECT_URI` must be exactly `{origin}/api/v1/auth/google/callback`, and it must be registered as an authorized redirect URI on that Google OAuth client.
@@ -268,13 +271,15 @@ No bearer: the signed `state` identifies the user. Every outcome is a **`302`** 
    - A missing, tampered or expired state → `UNAUTHENTICATED`.
    - This yields `user_id = sub` and `expectedEmail = email`.
 2. **Handle denial.** If Google sent `error` (e.g. `access_denied`) instead of `code` → `GMAIL_NOT_CONNECTED` with `reason=<Google error>`. A missing `code` → `VALIDATION_FAILED`.
-3. **Exchange the code** with `exchangeAuthorizationCode` (`OAuth2Client.getToken`), then call token info.
+3. **Exchange the code** with `exchangeAuthorizationCode` (`OAuth2Client.getToken`), then call `getTokenInfo(tokens.access_token)`.
+   - `sub` and `email` come from token info.
+   - `name` comes from the `name` claim of the exchange's `id_token`. That token is read without a signature check, because it came straight from Google's token endpoint over TLS (OpenID Connect Core §3.1.3.7). A missing claim gives `name = null` and doesn't fail the connect.
    - `invalid_grant` (expired or reused code) → `GMAIL_TOKEN_REVOKED`.
    - No refresh token returned → `GMAIL_NOT_CONNECTED`.
 4. **Check identity.** Token info must have `email` and `sub`; otherwise → `GMAIL_NOT_CONNECTED` with `reason=missing_email_scope`. The email must equal `expectedEmail` (case-insensitive); otherwise → `VALIDATION_FAILED` with `reason=EMAIL_MISMATCH`.
    - This is the CSRF defence: a victim tricked into completing a flow started with an attacker's `state` authorizes the victim's own Google account, whose email doesn't match the attacker's.
 5. **Check scopes.** If `gmail.modify` or `gmail.send` is missing → `GMAIL_NOT_CONNECTED` with `reason=missing_gmail_scope`.
-6. **Upsert** `users` on conflict `google_id` (linking rules in §5.2) with `google_id` (token-info `sub`), `user_id`, `email`, `refresh_token`, `scopes`, and `access_token` / `access_token_expires_at` as a pair (§3.1). Reset `history_id` to `null` on re-connect (this forces a full sync). Linking conflicts → `VALIDATION_FAILED` with `reason=GOOGLE_ACCOUNT_LINKED_ELSEWHERE` or `ANOTHER_GOOGLE_ACCOUNT_LINKED`.
+6. **Upsert** `users` on conflict `google_id` (linking rules in §5.2) with `google_id` (token-info `sub`), `user_id`, `email` (token-info `email`), `name` (id_token `name`), `refresh_token`, `scopes`, and `access_token` / `access_token_expires_at` as a pair (§3.1). Reset `history_id` to `null` on re-connect (this forces a full sync). Linking conflicts → `VALIDATION_FAILED` with `reason=GOOGLE_ACCOUNT_LINKED_ELSEWHERE` or `ANOTHER_GOOGLE_ACCOUNT_LINKED`.
 7. Call `MailProvider.watch()` (§4.5). If it fails, the failure is logged; it doesn't fail the connect.
 8. Run the initial **full sync** (§3.5). If it fails, the failure is logged and `initialSync=failed`. `history_id` then stays `null`, so the next push notification runs the full sync instead.
 
@@ -636,7 +641,8 @@ Constraints and indexes:
 |---|---|---|---|
 | `google_id` | `text` PK | no | Token-info `sub` of the connected Google account (§4.1). This is the upsert conflict target |
 | `user_id` | `uuid` `UNIQUE`, FK → `auth.users(id)` on delete cascade | no | `sub` claim of the verified bearer token (§3.1) |
-| `email` | `text` `UNIQUE` | no | `claims.email` of the bearer token (§4.1) |
+| `email` | `text` `UNIQUE` | no | Token-info `email` from the §4.1b exchange. It must match the bearer's `claims.email`, case-insensitively |
+| `name` | `text` | yes | The `name` claim of the §4.1b exchange's `id_token` (needs the `userinfo.profile` scope); `null` when absent |
 | `refresh_token` | `text`: ciphertext (§5.4) | yes | `refresh_token` from the §4.1b code exchange (or Google's rotated one later); `null` after revocation (§4.5, §4.6) |
 | `scopes` | `text[]` | no | Granted scopes from token info |
 | `access_token` | `text`: ciphertext (§5.4) | yes | §4.1b: the code exchange's `access_token`. Afterwards: `tokens.access_token` from the `'tokens'` event |
