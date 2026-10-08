@@ -127,7 +127,101 @@ describe('GET /api/v1/auth/google/start (§4.1a)', () => {
   });
 });
 
+describe('GET /api/v1/auth/google (§4.1c)', () => {
+  const OAUTH_ENV = {
+    JWT_SECRET: SECRET,
+    GOOGLE_CLIENT_ID: 'client-id.apps.googleusercontent.com',
+    GOOGLE_CLIENT_SECRET: 'client-secret',
+    GOOGLE_REDIRECT_URI: 'https://api.vibemail.test/api/v1/auth/google/callback',
+  };
+  let saved: NodeJS.ProcessEnv;
+  beforeEach(() => {
+    saved = { ...process.env };
+    Object.assign(process.env, OAUTH_ENV);
+  });
+  afterEach(() => {
+    process.env = saved;
+  });
+
+  it('302s to Google with a state the callback accepts', async () => {
+    const { h } = setup(false);
+    const response = await h.redirectConnect(get('/api/v1/auth/google', bearer()));
+    expect(response.status).toBe(302);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const target = new URL(response.headers.get('location') ?? '');
+    expect(target.origin).toBe('https://accounts.google.com');
+    expect(target.searchParams.get('client_id')).toBe(OAUTH_ENV.GOOGLE_CLIENT_ID);
+    expect(target.searchParams.get('redirect_uri')).toBe(OAUTH_ENV.GOOGLE_REDIRECT_URI);
+    expect(target.searchParams.get('login_hint')).toBe(EMAIL);
+    expect(target.searchParams.get('access_type')).toBe('offline');
+
+    const state = target.searchParams.get('state') ?? '';
+    const callback = await h.oauthCallback(get(`/api/v1/auth/google/callback?${new URLSearchParams({ code: 'c', state }).toString()}`));
+    expect(new URL(callback.headers.get('location') ?? '').searchParams.get('status')).toBe('connected');
+  });
+
+  it('rejects a missing bearer with the 401 envelope, not a redirect', async () => {
+    const { h } = setup(false);
+    const response = await h.redirectConnect(get('/api/v1/auth/google'));
+    expect(response.status).toBe(401);
+    expect(response.headers.get('location')).toBeNull();
+    await expect(envelope(response)).resolves.toMatchObject({ error: { code: 'UNAUTHENTICATED' } });
+  });
+
+  it.each(['JWT_SECRET', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI'])(
+    'answers 500 CONFIG_ERROR when initiateOAuth is missing %s',
+    async (variable) => {
+      delete process.env[variable];
+      const { h } = setup(false);
+      const response = await h.redirectConnect(get('/api/v1/auth/google', bearer()));
+      expect(response.status).toBe(500);
+      await expect(envelope(response)).resolves.toEqual({
+        error: { code: 'CONFIG_ERROR', message: 'server is not configured', retryable: false },
+      });
+    },
+  );
+
+  it('answers 500 CONFIG_ERROR when the app configuration is missing', async () => {
+    const h = createHandlers(() => {
+      throw new MissingEnvError('SUPABASE_URL');
+    });
+    const response = await h.redirectConnect(get('/api/v1/auth/google', bearer()));
+    expect(response.status).toBe(500);
+    await expect(envelope(response)).resolves.toMatchObject({ error: { code: 'CONFIG_ERROR' } });
+  });
+});
+
+describe('non-GET methods on the OAuth endpoints (§4.1)', () => {
+  it.each(['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])('%s → 405 METHOD_NOT_ALLOWED with Allow: GET', async (method) => {
+    const { h, box } = setup(false);
+    box.forbidCalls = true;
+    const request = (path: string) => new Request(`https://api.vibemail.test${path}`, { method });
+    for (const response of [
+      await h.oauthMethodNotAllowed(request('/api/v1/auth/google')),
+      await h.redirectConnect(request('/api/v1/auth/google')),
+      await h.oauthCallback(request('/api/v1/auth/google/callback')),
+    ]) {
+      expect(response.status).toBe(405);
+      expect(response.headers.get('allow')).toBe('GET');
+      await expect(envelope(response)).resolves.toEqual({
+        error: { code: 'METHOD_NOT_ALLOWED', message: 'only GET is allowed', retryable: false },
+      });
+    }
+  });
+});
+
 describe('GET /api/v1/auth/google/callback (§4.1b)', () => {
+  it('answers 500 CONFIG_ERROR, not a redirect, when the configuration is missing', async () => {
+    const h = createHandlers(() => {
+      throw new MissingEnvError('FRONTEND_URL');
+    });
+    const response = await h.oauthCallback(get('/api/v1/auth/google/callback?code=c&state=s'));
+    expect(response.status).toBe(500);
+    expect(response.headers.get('location')).toBeNull();
+    await expect(envelope(response)).resolves.toMatchObject({ error: { code: 'CONFIG_ERROR' } });
+  });
+
+
   const callback = (params: Record<string, string>) =>
     get(`/api/v1/auth/google/callback?${new URLSearchParams(params).toString()}`);
   const location = (response: Response) => new URL(response.headers.get('location') ?? '');

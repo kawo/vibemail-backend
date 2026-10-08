@@ -3,6 +3,7 @@
  * methods, and that a request without configuration yields a 500 envelope rather than a crash.
  */
 import * as start from '../../api/v1/auth/google/start';
+import * as redirectStart from '../../api/v1/auth/google/index';
 import * as callback from '../../api/v1/auth/google/callback';
 import * as list from '../../api/v1/messages/index';
 import * as send from '../../api/v1/messages/send';
@@ -13,7 +14,8 @@ import * as cron from '../../api/cron/renew-watch';
 describe('api/ function files (CONTRACT.md §4)', () => {
   it.each([
     ['start', start, ['GET', 'OPTIONS']],
-    ['callback', callback, ['GET']],
+    ['redirect start', redirectStart, ['DELETE', 'GET', 'OPTIONS', 'PATCH', 'POST', 'PUT']],
+    ['callback', callback, ['DELETE', 'GET', 'OPTIONS', 'PATCH', 'POST', 'PUT']],
     ['messages', list, ['GET', 'OPTIONS']],
     ['send', send, ['OPTIONS', 'POST']],
     ['read', read, ['OPTIONS', 'POST']],

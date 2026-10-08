@@ -8,6 +8,8 @@ export type ErrorCode =
   | 'GMAIL_RATE_LIMITED'
   | 'GMAIL_UPSTREAM_ERROR'
   | 'SYNC_FAILED'
+  | 'METHOD_NOT_ALLOWED'
+  | 'CONFIG_ERROR'
   | 'INTERNAL';
 
 /** A failure that maps 1:1 onto the §3.3 error envelope. */

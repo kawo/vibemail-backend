@@ -1,5 +1,6 @@
 import { Auth, google } from 'googleapis';
 import { requireEnv } from '../../config/env';
+import { issueState } from '../../middleware/oauthState';
 import {
   type AccountCredentials,
   type OnTokens,
@@ -211,6 +212,28 @@ export function buildAuthorizationUrl(
     state: options.state,
     ...(options.loginHint ? { login_hint: options.loginHint } : {}),
   });
+}
+
+/**
+ * Starts the redirect OAuth flow (CONTRACT.md §4.1c): signs a `state` for the user and builds the
+ * consent URL. Reads its configuration from env and throws `MissingEnvError` when any is missing.
+ */
+export function initiateOAuth(
+  user: { sub: string; email: string },
+  options: { env?: NodeJS.ProcessEnv; now?: Date } = {},
+): { url: string; state: string; expiresAt: Date } {
+  const env = options.env ?? process.env;
+  const stateSecret = requireEnv('JWT_SECRET', env);
+  const config: GmailAuthConfig = {
+    clientId: requireEnv('GOOGLE_CLIENT_ID', env),
+    clientSecret: requireEnv('GOOGLE_CLIENT_SECRET', env),
+    redirectUri: requireEnv('GOOGLE_REDIRECT_URI', env),
+    // Not needed to build a consent URL.
+    pubsubTopic: env.GOOGLE_PUBSUB_TOPIC ?? '',
+  };
+  const { state, expiresAt } = issueState(user, stateSecret, options.now);
+  const url = buildAuthorizationUrl(config, { state, scopes: CONSENT_SCOPES, loginHint: user.email });
+  return { url, state, expiresAt };
 }
 
 /** Exchanges an authorization code for tokens, then reads identity and scopes (CONTRACT.md §4.1b). */

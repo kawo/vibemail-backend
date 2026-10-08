@@ -13,6 +13,8 @@ export const ERROR_STATUS: Record<ErrorCode, { status: number; retryable: boolea
   GMAIL_RATE_LIMITED: { status: 429, retryable: true },
   GMAIL_UPSTREAM_ERROR: { status: 502, retryable: true },
   SYNC_FAILED: { status: 502, retryable: true },
+  METHOD_NOT_ALLOWED: { status: 405, retryable: false },
+  CONFIG_ERROR: { status: 500, retryable: false },
   INTERNAL: { status: 500, retryable: false },
 };
 
@@ -30,6 +32,14 @@ export function toApiError(error: unknown): ApiError {
     return new ApiError('INTERNAL', 'server is not configured');
   }
   return new ApiError('INTERNAL', 'internal error');
+}
+
+/** As `toApiError`, but missing configuration becomes `CONFIG_ERROR` (the OAuth endpoints, CONTRACT.md §4.1). */
+export function toOAuthApiError(error: unknown): ApiError {
+  if (error instanceof MissingEnvError) {
+    return new ApiError('CONFIG_ERROR', 'server is not configured');
+  }
+  return toApiError(error);
 }
 
 /** The §3.3 envelope: `{ error: { code, message, retryable, details? } }`. */

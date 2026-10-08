@@ -5,12 +5,12 @@ import { issueState, verifyState } from '../middleware/oauthState';
 import { toMessageDTO } from '../messages/dto';
 import { listMessages, parseListQuery } from '../messages/list';
 import { markMessageRead } from '../messages/markRead';
-import { CONSENT_SCOPES } from '../providers/gmail/auth';
+import { CONSENT_SCOPES, initiateOAuth } from '../providers/gmail/auth';
 import { sendForUser } from '../send';
 import { connectGmailAccount } from '../services/gmailAccount';
 import { handleGmailPush } from '../webhook/gmail';
 import type { AppDeps } from './deps';
-import { corsHeaders, errorResponse, jsonResponse, preflightResponse, toApiError } from './respond';
+import { corsHeaders, errorResponse, jsonResponse, preflightResponse, toApiError, toOAuthApiError } from './respond';
 
 /**
  * HTTP handlers for every function under `api/` (CONTRACT.md §4). Each `api/` file only binds
@@ -23,7 +23,10 @@ type Handler = (request: Request) => Promise<Response>;
 export interface Handlers {
   options: Handler;
   startConnect: Handler;
+  redirectConnect: Handler;
   oauthCallback: Handler;
+  /** Any non-GET method on the OAuth endpoints (CONTRACT.md §4.1). */
+  oauthMethodNotAllowed: Handler;
   listMessages: Handler;
   sendMessage: Handler;
   markRead: Handler;
@@ -55,6 +58,9 @@ export function createHandlers(getDeps: () => AppDeps): Handlers {
       }
     };
 
+  const methodNotAllowed = (): Response =>
+    errorResponse(new ApiError('METHOD_NOT_ALLOWED', 'only GET is allowed'), { Allow: 'GET' });
+
   const readJson = async (request: Request): Promise<unknown> => {
     try {
       return await request.json();
@@ -84,12 +90,41 @@ export function createHandlers(getDeps: () => AppDeps): Handlers {
       return jsonResponse({ authorizationUrl, expiresAt: expiresAt.toISOString() }, 200);
     }),
 
+    async redirectConnect(request) {
+      if (request.method !== 'GET') {
+        return methodNotAllowed();
+      }
+      let cors: Record<string, string> = {};
+      try {
+        const deps = getDeps();
+        cors = corsHeaders(deps.frontendUrl);
+        const user = requireUser(request, { jwtSecret: deps.jwtSecret, supabaseUrl: deps.supabaseUrl });
+        const { url } = initiateOAuth({ sub: user.userId, email: user.email }, { now: deps.now() });
+        return new Response(null, { status: 302, headers: { ...cors, Location: url, 'Cache-Control': 'no-store' } });
+      } catch (error) {
+        const apiError = toOAuthApiError(error);
+        if (apiError.code === 'INTERNAL' || apiError.code === 'CONFIG_ERROR') {
+          console.error('OAuth start failed', error instanceof Error ? error.message : error);
+        }
+        return errorResponse(apiError, cors);
+      }
+    },
+
+    async oauthMethodNotAllowed() {
+      return methodNotAllowed();
+    },
+
     async oauthCallback(request) {
+      if (request.method !== 'GET') {
+        return methodNotAllowed();
+      }
       let deps: AppDeps;
       try {
         deps = getDeps();
       } catch (error) {
-        return errorResponse(toApiError(error));
+        const apiError = toOAuthApiError(error);
+        console.error('OAuth callback failed', error instanceof Error ? error.message : error);
+        return errorResponse(apiError);
       }
       const target = new URL('/settings/gmail', deps.frontendUrl);
       const redirect = (params: Record<string, string>): Response => {
