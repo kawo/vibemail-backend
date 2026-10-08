@@ -118,6 +118,8 @@ type ErrorCode =
   | 'GMAIL_RATE_LIMITED'
   | 'GMAIL_UPSTREAM_ERROR'
   | 'SYNC_FAILED'
+  | 'METHOD_NOT_ALLOWED'
+  | 'CONFIG_ERROR'
   | 'INTERNAL';
 
 interface ErrorResponse {
@@ -140,6 +142,8 @@ interface ErrorResponse {
 | `GMAIL_RATE_LIMITED` | 429 | true | Gmail returned 429 or a 403 `rateLimitExceeded`/`userRateLimitExceeded`. Sets the `Retry-After` header (seconds). |
 | `GMAIL_UPSTREAM_ERROR` | 502 | true | Gmail returned 5xx or an unexpected 4xx. |
 | `SYNC_FAILED` | 502 | true | Reserved. Webhook syncs run after the ack (§4.5), so their failures are logged, not returned. |
+| `METHOD_NOT_ALLOWED` | 405 | false | The OAuth endpoints (§4.1) received a method other than `GET`. Sets the `Allow: GET` header. |
+| `CONFIG_ERROR` | 500 | false | The OAuth endpoints (§4.1) are missing a required environment variable. Other endpoints report this as `INTERNAL` (§3.6). |
 | `INTERNAL` | 500 | false | Unhandled server or DB error. |
 
 ### 3.4 `MessageDTO`
@@ -213,7 +217,7 @@ The procedure is shared by the connect endpoint (§4.1) and the webhook (§4.5);
 | `FRONTEND_URL` | CORS (§3.2) |
 | `CRON_SECRET` | Cron authentication (§4.6). The name is fixed by Vercel |
 
-A missing required variable fails the function with `500 INTERNAL` and a log line naming the variable, never its value.
+A missing required variable fails the function with `500 INTERNAL` and a log line naming the variable, never its value. The OAuth redirect endpoints (§4.1b, §4.1c) answer `500 CONFIG_ERROR` instead.
 
 ---
 
@@ -221,8 +225,9 @@ A missing required variable fails the function with `500 INTERNAL` and a log lin
 
 ### 4.1 Connect Gmail — backend OAuth flow
 
-Two endpoints:
+Two endpoints, plus a redirect variant of the start endpoint:
 - **Start** (`GET /api/v1/auth/google/start`): the frontend `fetch`es it with the bearer, then sends the browser to the returned URL.
+- **Redirect start** (`GET /api/v1/auth/google`, §4.1c): the same as Start, but it answers `302` to Google.
 - **Callback** (`GET /api/v1/auth/google/callback`): Google redirects the browser there, and it redirects back to the frontend.
 
 #### 4.1a Start — `GET /api/v1/auth/google/start`
@@ -275,7 +280,26 @@ No bearer: the signed `state` identifies the user. Every outcome is a **`302`** 
 
 **Error codes** (in the redirect's `code` parameter): `UNAUTHENTICATED`, `VALIDATION_FAILED`, `GMAIL_TOKEN_REVOKED`, `GMAIL_NOT_CONNECTED`, `GMAIL_RATE_LIMITED`, `GMAIL_UPSTREAM_ERROR`, `INTERNAL`.
 
-If `FRONTEND_URL` itself is not configured, the callback answers `500` with the §3.3 envelope instead of redirecting.
+If the configuration itself is missing (e.g. `FRONTEND_URL`), the callback answers `500 CONFIG_ERROR` with the §3.3 envelope instead of redirecting. Any method other than `GET` → `405 METHOD_NOT_ALLOWED` (envelope, `Allow: GET`).
+
+#### 4.1c Redirect start — `GET /api/v1/auth/google`
+
+The same as §4.1a, but it answers with a redirect instead of JSON.
+
+**Request:** `Authorization: Bearer <Supabase access token>` (§3.1). No body or query.
+
+**Behavior:** `initiateOAuth` (`src/providers/gmail/auth.ts`) issues the signed `state` (format as in §4.1a) for the bearer's `sub` and `email`, and builds the consent URL. The response is **`302`** with `Location: <consent URL>` and `Cache-Control: no-store`.
+
+A browser's top-level navigation can't send an `Authorization` header. So this endpoint serves clients that can set headers on the request they follow, for example native apps and webviews. Browser frontends use §4.1a.
+
+**Errors** (§3.3 envelope, no redirect):
+
+| Code | HTTP | When |
+|---|---|---|
+| `METHOD_NOT_ALLOWED` | 405 | Any method other than `GET`. Sets `Allow: GET`. |
+| `UNAUTHENTICATED` | 401 | Missing or invalid bearer. |
+| `CONFIG_ERROR` | 500 | `JWT_SECRET`, `SUPABASE_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` or another required variable is missing. |
+| `INTERNAL` | 500 | An unexpected exception. |
 
 ---
 
